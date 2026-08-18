@@ -1921,6 +1921,9 @@ def _build_server(graph_path: str):
             top_k=top_k,
             file_type=file_type,
             min_score=min_score,
+            # C2.4: resolve each row's type through the live graph; search.py
+            # stays graph-agnostic — only the callable crosses the boundary.
+            file_type_lookup=lambda nid: G.nodes[nid].get("file_type", ""),
         )
         if not rows:
             return "No semantic matches."  # absent sidecar / filtered-empty: C2.8 refines

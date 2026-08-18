@@ -208,3 +208,57 @@ def test_search_vectors_min_score_drops_strictly_below_keeps_exact(tmp_path):
         "a row at exactly == min_score (n-a-01, score 1.0) must be KEPT; "
         "n-c-03 (0.5 < 1.0) must be dropped"
     )
+
+
+def test_search_vectors_file_type_filter_reads_injected_lookup(tmp_path):
+    """T9 — the file_type allow-set must be resolved through the INJECTED per-id
+    lookup, never a hardcoded table and never `""`-for-everything.
+
+    The seam design: ``search_vectors(..., file_type_lookup=node_file_type)`` and
+    the serve handler passes a closure over the live graph. ``node_file_type``
+    (search.py:87-90) currently returns ``""`` for EVERY id, so on today's code
+    any allow-set silently drops ALL rows — that is the red this test locks.
+    ``search_vectors`` does not accept a ``file_type_lookup`` keyword yet, so the
+    call itself fails (or, if green only adds an ignored/empty keyword, the
+    per-lookup assertions fail). The lookup must be injected because the sole
+    fixture file_type values are bound to the fixture ids; a filter hardcoded to
+    those ids would pass the T9 arms and wrongly survive. The guard below maps
+    EVERY id to ``"video"`` and asserts ``file_type=["video"]`` keeps all three
+    rows AND that the score-desc order is preserved — only a filter that consults
+    the actual injected lookup can pass while a hardcoded/inert filter cannot.
+
+    Fixture file_types (n-a-01 -> document, n-b-02 -> concept, n-c-03 ->
+    document) + identity basis + canonical stub embed (q[1] > q[0] > q[2]):
+    score_document = 1.0 > 0.5, so the survivors render score-descending.
+    """
+    sidecar = _write_sidecar(tmp_path)
+
+    fixture_types = dict(zip(IDS, FILE_TYPES, strict=True))
+    real_lookup = lambda nid: fixture_types.get(nid, "")  # noqa: E731
+
+    # Guard arm: every id resolves to "video"; the filter must consult the
+    # INJECTED lookup, not a fixture-bound hardcoded table. On today's code the
+    # keyword doesn't exist, so this call errors out — the red.
+    all_rows = search_vectors(
+        sidecar,
+        "query",
+        space="text",
+        file_type=["video"],
+        file_type_lookup=lambda nid: "video",
+    )
+    assert [r["id"] for r in all_rows] == ["n-b-02", "n-a-01", "n-c-03"], (
+        "file_type filter must resolve types through the injected file_type_lookup; "
+        "an inert or ""-for-everything lookup wrongly drops ALL rows"
+    )
+
+    # T9 arms against the REAL fixture types.
+    docs = search_vectors(sidecar, "query", space="text", file_type=["document"], file_type_lookup=real_lookup)
+    assert [r["id"] for r in docs] == ["n-a-01", "n-c-03"], (
+        "document rows must survive in score-desc order: n-a-01 (1.0) above n-c-03 (0.5); "
+        "a missing or ""-returning file_type lookup drops ALL rows"
+    )
+    concept_rows = search_vectors(sidecar, "query", space="text", file_type=["concept"], file_type_lookup=real_lookup)
+    assert [r["id"] for r in concept_rows] == ["n-b-02"]
+    assert search_vectors(sidecar, "query", space="text", file_type=["audio"], file_type_lookup=real_lookup) == [], (
+        "a file_type matching nothing must yield []"
+    )

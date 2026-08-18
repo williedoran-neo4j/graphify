@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 
 
 def _stub_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
@@ -42,6 +43,12 @@ def load_sidecar(path: str | os.PathLike) -> dict | None:
         }
 
 
+def node_file_type(nid: str) -> str:
+    """``search_vectors`` file-type helper seam (C2.5 will own this lookup)."""
+    del nid
+    return ""
+
+
 def search_vectors(
     path: str | os.PathLike,
     query: str,
@@ -51,13 +58,15 @@ def search_vectors(
     file_type: list[str] | None = None,
     min_score: float = 0.0,
     query_embed=_stub_query_embed,
+    file_type_lookup: Callable[[str], str] = node_file_type,
 ) -> list[dict] | None:
     """Rank the sidecar rows against the query, score-descending.
 
     Returns a list of ``{"id", "score", "space"}`` rows (the handler joins them
     to the graph's nodes for label/file_type), or ``None`` when the sidecar is
     absent. ``min_score`` drops rows strictly below the threshold before the
-    ``file_type`` allow-set, then results are sorted score-descending and cut
+    ``file_type`` allow-set (each row's type resolved through the injected
+    ``file_type_lookup``), then results are sorted score-descending and cut
     to ``top_k``.``.
     """
     import numpy as np
@@ -78,13 +87,7 @@ def search_vectors(
         {"id": str(nid), "score": float(score), "space": space}
         for nid, score in zip(text_ids, scores, strict=False)
         if score >= min_score
-        if allow is None or node_file_type(nid) in allow
+        if allow is None or file_type_lookup(nid) in allow
     )
     ranked = sorted(rows, key=lambda r: r["score"], reverse=True)
     return ranked[:top_k]
-
-
-def node_file_type(nid: str) -> str:
-    """``search_vectors`` file-type helper seam (C2.5 will own this lookup)."""
-    del nid
-    return ""
