@@ -182,3 +182,29 @@ def test_semantic_search_renders_pinned_text_surface(tmp_path):
     assert rendered_scores == sorted(rendered_scores, reverse=True), (
         "scores must be rendered score-descending"
     )
+
+
+def test_search_vectors_min_score_drops_strictly_below_keeps_exact(tmp_path):
+    """T8 — min_score excludes rows whose cosine is < min_score, and KEEPS a
+    row at exactly == min_score (strict `<` drop). Sole-reason lock: against
+    the identity fixture + canonical stub embed, score_j == q[j] and the exact
+    float32-representable scores are b=2.0, a=1.0, c=0.5.
+      * min_score=3.0 (above the top row)  -> empty result;
+      * min_score=0.75 (between rows)      -> only [n-b-02, n-a-01], in order;
+      * min_score=1.0 (== row a's score)   -> n-a-01 SURVIVES, n-c-03 dropped.
+    A `>` (strict-greater) drop fails the last assertion (a would vanish); a
+    missing filter leaves n-c-03 present and fails the first three.
+    """
+    sidecar = _write_sidecar(tmp_path)
+    assert search_vectors(sidecar, "query", space="text", min_score=3.0) == [], (
+        "min_score above the top row must yield an empty result"
+    )
+    rows = search_vectors(sidecar, "query", space="text", min_score=0.75)
+    assert [r["id"] for r in rows] == ["n-b-02", "n-a-01"], (
+        "rows with cosine < 0.75 must be excluded, survivors in score-desc order"
+    )
+    rows_at_boundary = search_vectors(sidecar, "query", space="text", min_score=1.0)
+    assert [r["id"] for r in rows_at_boundary] == ["n-b-02", "n-a-01"], (
+        "a row at exactly == min_score (n-a-01, score 1.0) must be KEPT; "
+        "n-c-03 (0.5 < 1.0) must be dropped"
+    )
