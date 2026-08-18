@@ -1903,14 +1903,34 @@ def _build_server(graph_path: str):
         return "\n\n".join(lines)
 
     def _tool_semantic_search(arguments: dict) -> str:
-        # R2 C2.1 stub: only registration/schema is under test here. Ranked
-        # compute lands with C2.2's search_vectors, which also brings the
-        # pinned render surface.
+        # R2 C2.2: rank the embeddings sidecar in memory and render the pinned
+        # line surface. Lazy import keeps numpy out of serve.py's module scope
+        # (T14). The exact absent-sidecar text is C2.8's change; for now an
+        # absent sidecar honestly reports no matches.
+        from graphify.search import search_vectors
+
         query = arguments["query"]
         top_k = int(arguments.get("top_k", 10))
         file_type = arguments.get("file_type")
         min_score = float(arguments.get("min_score", 0.3))
-        return "no semantic matches yet"
+        sidecar_path = Path(active_graph_path).parent / "embeddings.npz"
+        rows = search_vectors(
+            sidecar_path,
+            query,
+            space="text",
+            top_k=top_k,
+            file_type=file_type,
+            min_score=min_score,
+        )
+        if not rows:
+            return "No semantic matches."  # absent sidecar / filtered-empty: C2.8 refines
+        lines = [
+            f"{r['score']:.3f}  [{r['space']}]  {r['id']}  "
+            f"{G.nodes[r['id']].get('label', r['id'])}  "
+            f"({G.nodes[r['id']].get('file_type', '')})"
+            for r in rows
+        ]
+        return "\n".join(lines)
 
     _handlers = {
         "query_graph": _tool_query_graph,

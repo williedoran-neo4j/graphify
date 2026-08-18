@@ -1,0 +1,90 @@
+"""Semantic search over the text-space sidecar — R2 C2.2.
+
+``search_vectors`` is the pure compute core: load the sidecar, embed the query
+via the injected seam (``_stub_query_embed`` is the deterministic C4 query-embed
+stub, replaced by the real backend in R3), score rows as ``text_vecs @ q``
+(stored rows are L2-normalized from R1 I3, so cosine is a plain dot product),
+and return ranked result rows. The absent-sidecar case returns ``None`` — the
+seam the serve handler keys off.
+"""
+from __future__ import annotations
+
+import json
+import os
+
+
+def _stub_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
+    # C4 query-embed stub: deterministic per query, satisfying q[1] > q[0] > q[2]
+    # (the ranking premise pinned in tests/test_embed_search.py). The real
+    # backend lands in R3; until then the query string is deliberately ignored.
+    del query, space, meta
+    return [1.0, 2.0, 0.5, 0, 0, 0, 0, 0]
+
+
+def load_sidecar(path: str | os.PathLike) -> dict | None:
+    """Load the embeddings sidecar ``.npz``, or ``None`` when it is absent.
+
+    Returns the stored arrays: ``text_ids`` (unicode ids), ``text_vecs``
+    (float32 rows) and ``text_meta`` (a JSON string under R1's writer).
+    numpy is imported inside the function so module import never pulls it in
+    (serve.py's lazy-load guard depends on that).
+    """
+    import numpy as np
+
+    npz_path = os.fspath(path)
+    if not os.path.exists(npz_path):
+        return None
+    with np.load(npz_path, allow_pickle=False) as data:
+        return {
+            "text_ids": data["text_ids"],
+            "text_vecs": data["text_vecs"],
+            "text_meta": data["text_meta"],
+        }
+
+
+def search_vectors(
+    path: str | os.PathLike,
+    query: str,
+    *,
+    space: str,
+    top_k: int = 10,
+    file_type: list[str] | None = None,
+    min_score: float = 0.0,
+    query_embed=_stub_query_embed,
+) -> list[dict] | None:
+    """Rank the sidecar rows against the query, score-descending.
+
+    Returns a list of ``{"id", "score", "space"}`` rows (the handler joins them
+    to the graph's nodes for label/file_type), or ``None`` when the sidecar is
+    absent. ``min_score`` drops rows strictly below the threshold before the
+    ``file_type`` allow-set, then results are sorted score-descending and cut
+    to ``top_k``.``.
+    """
+    import numpy as np
+
+    sidecar = load_sidecar(path)
+    if sidecar is None:
+        return None
+    text_ids = sidecar["text_ids"]
+    text_vecs = sidecar["text_vecs"]
+    try:
+        meta = json.loads(str(sidecar["text_meta"]))
+    except (ValueError, TypeError):
+        meta = {}
+    q = np.asarray(query_embed(query, space=space, meta=meta), dtype=np.float32)
+    scores = text_vecs @ q
+    allow = set(file_type) if file_type else None
+    rows = (
+        {"id": str(nid), "score": float(score), "space": space}
+        for nid, score in zip(text_ids, scores, strict=False)
+        if score >= min_score
+        if allow is None or node_file_type(nid) in allow
+    )
+    ranked = sorted(rows, key=lambda r: r["score"], reverse=True)
+    return ranked[:top_k]
+
+
+def node_file_type(nid: str) -> str:
+    """``search_vectors`` file-type helper seam (C2.5 will own this lookup)."""
+    del nid
+    return ""
