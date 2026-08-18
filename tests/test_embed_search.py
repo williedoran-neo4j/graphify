@@ -88,15 +88,16 @@ def _write_sidecar(tmp_path: Path) -> Path:
     return path
 
 
-def _graph_file(tmp_path: Path) -> Path:
+def _graph_file(tmp_path: Path, labels: tuple[str, str, str] = LABELS) -> Path:
+    """graph.json whose node labels are ``labels`` (default: the clean LABELS)."""
     g = {
         "directed": True,
         "nodes": [
-            {"id": IDS[0], "label": LABELS[0], "source_file": SOURCE_FILES[0],
+            {"id": IDS[0], "label": labels[0], "source_file": SOURCE_FILES[0],
              "file_type": FILE_TYPES[0], "community": 0},
-            {"id": IDS[1], "label": LABELS[1], "source_file": SOURCE_FILES[1],
+            {"id": IDS[1], "label": labels[1], "source_file": SOURCE_FILES[1],
              "file_type": FILE_TYPES[1], "community": 0},
-            {"id": IDS[2], "label": LABELS[2], "source_file": SOURCE_FILES[2],
+            {"id": IDS[2], "label": labels[2], "source_file": SOURCE_FILES[2],
              "file_type": FILE_TYPES[2], "community": 0},
         ],
         "edges": [],
@@ -387,3 +388,72 @@ def test_semantic_search_sidecar_loaded_once_across_repeated_calls(tmp_path, mon
         "the sidecar must be loaded ONCE and cached on the graph object; "
         f"two semantic_search calls opened it {len(calls)} time(s): {calls}"
     )
+
+
+def test_semantic_search_neutralizes_control_char_in_rendered_label(tmp_path):
+    """C2.7/T11 (F1) — every LLM-derived value the render emits must be routed
+    through sanitize_label, so an injected control-char sentinel in a node label
+    NEVER reaches the tool's returned text.
+
+    Fixture: n-a-01's label carries "\x1f" (a CHARMATCHER for security.py's
+    ``_CONTROL_CHAR_RE`` = ``[\x00-\x1f\x7f]``, security.py:390). sanitize_label
+    substitutes an EMPTY STRING for control chars, so the NEUTRALIZED label is
+    ``"Alphaembed"`` (``"\x1f"`` deleted, NOT replaced with a space — security.py
+    line 402). Rows are otherwise identical to the C2.2 fixture, so the ranking
+    stays ["n-b-02" (2.0), "n-a-01" (1.0), "n-c-03" (0.5)] and every OTHER row
+    must still match the pinned C2.2 render regex — no regression to the normal
+    render surface.
+
+    Sole-reason lock: today the render emits label VERBATIM (serve.py:1956,
+    ``G.nodes[r['id']].get('label', r['id'])``), so the raw "\x1f" byte lands in
+    the returned text and the sentinel-absence assert below fails RED.
+
+    Guarded variants must ALL go red with today's code:
+      * strip control chars from only the id/score but pass the label through
+        verbatim — the "\x1f" still leaks (sentinel-absence assert fails);
+      * strip NULLs or a "\n"-specific pattern only — "\x1f" survives;
+      * drop the poisoned row entirely — the n-a-01 presence assert bars the
+        cheap "filter out rows with a dirty label" escape (n-a-01's label would
+        not be RENDERED, so a raw-sentinel scan would pass vacuously).
+    """
+    sentinel = "\x1f"
+    assert sentinel in "Alpha\x1fembed", "sentinel must be a byte in the fixture label"
+    poisoned_labels = ("Alpha\x1fembed", LABELS[1], LABELS[2])
+    _write_sidecar(tmp_path)  # ids/vectors unchanged — only graph.json carries the sentinel
+    server = serve_mod._build_server(str(_graph_file(tmp_path, labels=poisoned_labels)))
+    result_future = server.request_handlers[CallToolRequest](
+        CallToolRequest(params=CallToolRequestParams(name="semantic_search", arguments={"query": "query"}))
+    )
+    if asyncio.iscoroutine(result_future):
+        result = asyncio.run(result_future)
+    else:  # newer mcp majors may return an awaitable/wrapped result directly
+        result = result_future
+    result_text = result.root.content[0].text
+    assert sentinel not in result_text, (
+        "rendered text must NOT contain the raw control-char sentinel — "
+        "serve.py must route the rendered label through sanitize_label"
+    )
+    # Guard: the poisoned ROW must still render (not "empty-or-dropped").
+    assert "n-a-01" in result_text, (
+        "the poisoned row must itself render (id present) — dropping the row "
+        "would be an invalid fix this lock forbids"
+    )
+    # The neutralized label is the exact sanitize_label output (control char
+    # DELETED — no space inserted — and not truncated).
+    assert "Alphaembed" in result_text, (
+        f"label must render NEUTRALIZED as sanitize_label's exact output; got "
+        f"{result_text!r}"
+    )
+    # Every OTHER row must still match the pinned C2.2 render surface.
+    assert "[text]" in result_text, "render lacks the [text] space literal"
+    lines = result_text.splitlines()
+    assert len(lines) == 3, f"expected 3 rendered rows, got {lines!r}"
+    assert re.fullmatch(
+        r"(\d+\.\d{3})  \[text\]  (\S+)  (.+)  \((\w+)\)", lines[0]
+    ), f"{lines[0]!r} no longer matches the pinned render surface"
+    assert re.fullmatch(
+        r"(\d+\.\d{3})  \[text\]  (\S+)  (.+)  \((\w+)\)", lines[1]
+    ), f"{lines[1]!r} no longer matches the pinned render surface"
+    assert re.fullmatch(
+        r"(\d+\.\d{3})  \[text\]  (\S+)  (.+)  \((\w+)\)", lines[2]
+    ), f"{lines[2]!r} no longer matches the pinned render surface"

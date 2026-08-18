@@ -1954,9 +1954,9 @@ def _build_server(graph_path: str):
         if not rows:
             return "No semantic matches."  # absent sidecar / filtered-empty: C2.8 refines
         lines = [
-            f"{r['score']:.3f}  [{r['space']}]  {r['id']}  "
-            f"{G.nodes[r['id']].get('label', r['id'])}  "
-            f"({G.nodes[r['id']].get('file_type', '')})"
+            f"{r['score']:.3f}  [{r['space']}]  {sanitize_label(r['id'])}  "
+            f"{sanitize_label(G.nodes[r['id']].get('label', r['id']))}  "
+            f"({sanitize_label(G.nodes[r['id']].get('file_type', ''))})"
             for r in rows
         ]
         return "\n".join(lines)
