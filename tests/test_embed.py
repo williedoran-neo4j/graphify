@@ -58,11 +58,15 @@ def _small_graph() -> nx.Graph:
     return g
 
 
-def test_enrich_writes_sidecar_keys_and_dtype(tmp_path):
+def test_enrich_writes_sidecar_keys_and_dtype(tmp_path, monkeypatch):
     """T4 — ``enrich_embeddings`` writes sibling ``embeddings.npz`` exactly for
     the text family: keys are exactly ``text_ids``/``text_vecs``/``text_meta``,
     vectors are float32, and the image node's id is absent from ``text_ids``
     (the enrich half of T3)."""
+    monkeypatch.setattr(
+        "graphify.embed._call_embeddings",
+        lambda backend, model, inputs: [[1.0] * _STUB_DIM] * len(inputs),
+    )
     out = enrich_embeddings(_small_graph(), tmp_path / "graph.json")
 
     npz_path = tmp_path / "embeddings.npz"
@@ -77,10 +81,14 @@ def test_enrich_writes_sidecar_keys_and_dtype(tmp_path):
         assert "n-IMG-07" not in ids
 
 
-def test_sidecar_meta_fields(tmp_path):
+def test_sidecar_meta_fields(tmp_path, monkeypatch):
     """T6 — ``text_meta`` parses to a JSON object carrying model, backend, dim,
     graphify_version and created_at; ``dim`` matches ``text_vecs.shape[1]``
     (I5), proving the writer records the dimension it actually stored."""
+    monkeypatch.setattr(
+        "graphify.embed._call_embeddings",
+        lambda backend, model, inputs: [[1.0] * _STUB_DIM] * len(inputs),
+    )
     enrich_embeddings(_small_graph(), tmp_path / "graph.json")
 
     with np.load(tmp_path / "embeddings.npz") as data:

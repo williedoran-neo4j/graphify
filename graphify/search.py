@@ -29,6 +29,10 @@ def load_sidecar(path: str | os.PathLike) -> dict | None:
     (float32 rows) and ``text_meta`` (a JSON string under R1's writer).
     numpy is imported inside the function so module import never pulls it in
     (serve.py's lazy-load guard depends on that).
+
+    Enforces invariant I5 at the single load chokepoint (RT7): when the stored
+    ``text_meta["dim"]`` disagrees with ``text_vecs.shape[1]``, raises
+    ``ValueError`` instead of letting a dimension mix flow onward.
     """
     import numpy as np
 
@@ -36,11 +40,20 @@ def load_sidecar(path: str | os.PathLike) -> dict | None:
     if not os.path.exists(npz_path):
         return None
     with np.load(npz_path, allow_pickle=False) as data:
-        return {
-            "text_ids": data["text_ids"],
-            "text_vecs": data["text_vecs"],
-            "text_meta": data["text_meta"],
-        }
+        text_ids = data["text_ids"]
+        text_vecs = data["text_vecs"]
+        text_meta = data["text_meta"]
+    meta = json.loads(str(text_meta))
+    if int(meta["dim"]) != int(text_vecs.shape[1]):
+        raise ValueError(
+            f"sidecar embeddings.npz meta dim {int(meta['dim'])} "
+            f"does not match stored text_vecs width {int(text_vecs.shape[1])}"
+        )
+    return {
+        "text_ids": text_ids,
+        "text_vecs": text_vecs,
+        "text_meta": text_meta,
+    }
 
 
 def node_file_type(nid: str) -> str:

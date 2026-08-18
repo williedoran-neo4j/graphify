@@ -648,3 +648,54 @@ def test_semantic_search_every_line_carries_space_text(tmp_path):
             f"every rendered result line must carry its [text] space literal; "
             f"{line!r} does not"
         )
+
+
+def test_load_sidecar_validates_meta_dim_against_stored_rows(tmp_path):
+    """RT7 — load_sidecar is the SINGLE load chokepoint and must enforce
+    invariant I5 at load time: a sidecar whose ``text_meta["dim"]`` DIFFERS from
+    ``text_vecs.shape[1]`` raises ``ValueError``; a matching sidecar loads fine.
+    A malformed sidecar must never flow onward into search_vectors/serve.py —
+    I5's "never pass a dimension mix onward" (the write-side guard is the
+    seam-side half; this is the load-side half).
+
+    Sole-reason lock: the mismatch fixture differs from the matching one ONLY in
+    the stored ``text_meta["dim"]`` value (``_STUB_DIM + 1`` vs ``_STUB_DIM``) —
+    rows, ids, and every other meta key are identical. The matching arm is a
+    control proving the check is a real comparison and not a blanket reject.
+
+    RED (guaranteed) today: load_sidecar returns the raw arrays unchanged with
+    no meta parse and no dim check, so the mismatch arm FAILS on
+    ``pytest.raises(ValueError)``.
+    """
+    meta = {
+        "model": "nomic-embed-text",
+        "backend": "ollama",
+        "dim": _STUB_DIM,
+        "graphify_version": "test",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    }
+
+    mismatched = tmp_path / "embeddings.npz"
+    np.savez(
+        mismatched,
+        text_ids=np.array(IDS, dtype=str),
+        text_vecs=_ORTHO,
+        text_meta=json.dumps({**meta, "dim": _STUB_DIM + 1}),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_sidecar(mismatched)
+    assert "dim" in str(excinfo.value), (
+        "the ValueError must name the dim mismatch; got "
+        f"{str(excinfo.value)!r}"
+    )
+
+    matching = tmp_path / "matching.npz"
+    np.savez(
+        matching,
+        text_ids=np.array(IDS, dtype=str),
+        text_vecs=_ORTHO,
+        text_meta=json.dumps(meta),
+    )
+    loaded = load_sidecar(matching)
+    assert loaded is not None
+    assert loaded["text_vecs"].shape == (len(IDS), _STUB_DIM)
