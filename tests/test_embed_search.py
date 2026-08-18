@@ -520,3 +520,35 @@ def test_semantic_search_absent_sidecar_returns_embed_instruction(tmp_path):
     assert "n-b-02" in rows_text and "[text]" in rows_text, (
         f"with min_score cleared the sidecar must render real rows, got {rows_text!r}"
     )
+
+
+def test_semantic_search_every_line_carries_space_text(tmp_path):
+    """T10 (C2.10) — every rendered result line carries its `[text]` space
+    token; the space literal is PER-LINE, not a one-occurrence-in-the-output
+    accident.
+
+    Guard invariant I4: each rendered row names its own space (`"text"` today —
+    R2 has exactly one space; R10 later adds `code_*`). Sole-reason lock: a
+    render that emits the `[text]` token only on the first line (e.g. a header
+    carrying the space while data rows skip it) still satisfies a whole-output
+    `"[text]" in text` check, but FAILS this per-line walk — which is the hole
+    the C2.10 entry calls out.
+
+    The line count assert (== 3) is not decorative: it fixes the number of
+    fixture rows, so the walk genuinely touches every rendered row rather than
+    shrinking to a vacuous single-line pass. Dropping `[{space}]` from the
+    render (mutator) fires the per-line assert red on every row.
+    """
+    _write_sidecar(tmp_path)
+    server = serve_mod._build_server(str(_graph_file(tmp_path)))
+    result_text = _invoke_semantic_search(server, query="query")
+    lines = result_text.splitlines()
+    assert len(lines) == 3, (
+        f"the fixture must render exactly 3 rows for the per-line walk to be "
+        f"meaningful, got {len(lines)}: {lines!r}"
+    )
+    for line in lines:
+        assert "[text]" in line, (
+            f"every rendered result line must carry its [text] space literal; "
+            f"{line!r} does not"
+        )
