@@ -1538,6 +1538,21 @@ def _build_server(graph_path: str):
                 },
             ),
             types.Tool(
+                name="semantic_search",
+                description="Search nodes by meaning (vector cosine over embeddings.npz). Optional: top_k, file_type, min_score.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "top_k": {"type": "integer", "default": 10},
+                        "file_type": {"type": "array", "items": {"type": "string"},
+                                     "description": "Optional: restrict to these file_types"},
+                        "min_score": {"type": "number", "default": 0.3},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.Tool(
                 name="get_node",
                 description="Get full details for a specific node by label or ID.",
                 inputSchema={
@@ -1887,8 +1902,19 @@ def _build_server(graph_path: str):
             )
         return "\n\n".join(lines)
 
+    def _tool_semantic_search(arguments: dict) -> str:
+        # R2 C2.1 stub: only registration/schema is under test here. Ranked
+        # compute lands with C2.2's search_vectors, which also brings the
+        # pinned render surface.
+        query = arguments["query"]
+        top_k = int(arguments.get("top_k", 10))
+        file_type = arguments.get("file_type")
+        min_score = float(arguments.get("min_score", 0.3))
+        return "no semantic matches yet"
+
     _handlers = {
         "query_graph": _tool_query_graph,
+        "semantic_search": _tool_semantic_search,
         "get_node": _tool_get_node,
         "get_neighbors": _tool_get_neighbors,
         "get_community": _tool_get_community,
