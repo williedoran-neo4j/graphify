@@ -22,6 +22,15 @@ def build_node_text(node: dict) -> str | None:
 _STUB_DIM = 8
 
 
+def _l2_normalize(rows: np.ndarray) -> np.ndarray:
+    """L2-normalize each row so ``‖v‖ == 1.0``; zero-norm rows stay zero."""
+    import numpy as np
+
+    arr = np.asarray(rows, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return np.divide(arr, norms, out=np.zeros_like(arr), where=norms != 0)
+
+
 def _call_embeddings(backend: str, model: str, inputs: list[str]) -> list[list[float]]:
     """C2 seam (stub): deterministic per-input vectors, no HTTP.
 
@@ -74,7 +83,7 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
     np.savez(
         npz_path,
         text_ids=np.array(ids, dtype=str),
-        text_vecs=vecs,
+        text_vecs=_l2_normalize(vecs),
         text_meta=json.dumps(meta),
     )
     return npz_path

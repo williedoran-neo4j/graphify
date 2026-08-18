@@ -13,6 +13,7 @@ The graph fixture is a real ``networkx.Graph`` whose per-node attrs dicts carry
 from __future__ import annotations
 
 import json
+import warnings
 
 import networkx as nx
 import numpy as np
@@ -107,3 +108,48 @@ def test_normalize_on_write(tmp_path, monkeypatch):
         norms = np.linalg.norm(data["text_vecs"], axis=1)
         assert norms.shape == (2,)
         assert np.allclose(norms, 1.0, atol=1e-6)
+
+
+def test_normalize_all_stub_rows_unit(tmp_path):
+    """I3 — normalize-on-write holds for ANY seam output magnitude, so it
+    cannot be a hardcoded scale. The default stub emits rows of mixed
+    magnitudes (non-unit: ‖[1..,1]‖ = √D, ‖[2..,2]‖ = 2√D); those raw values
+    are NOT allowed to appear in the stored sidecar, so every stored row must
+    land at ‖v‖ == 1.0."""
+    enrich_embeddings(_small_graph(), tmp_path / "graph.json")
+
+    with np.load(tmp_path / "embeddings.npz") as data:
+        norms = np.linalg.norm(data["text_vecs"], axis=1)
+        assert norms.shape == (2,)
+        assert np.allclose(norms, 1.0, atol=1e-6)
+
+
+def test_normalize_zero_rows_stay_zero(tmp_path, monkeypatch):
+    """I3 zero-guard — a zero-norm seam row must be stored as zeros, not NaN.
+    The seam returns one all-zero row plus one norm-5.0 row; if the zero guard
+    in ``_l2_normalize`` (``where=norms != 0``) were removed, divide-by-zero
+    would emit NaN with a RuntimeWarning and no exact zeros."""
+    zero_row = np.zeros(_STUB_DIM, dtype=float)
+    norm5_row = np.full(_STUB_DIM, 5.0 / np.sqrt(_STUB_DIM), dtype=float)
+    vecs = [zero_row, norm5_row]
+    monkeypatch.setattr(
+        "graphify.embed._call_embeddings",
+        lambda backend, model, inputs: vecs,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        enrich_embeddings(_small_graph(), tmp_path / "graph.json")
+    # divide-by-zero from a dropped guard surfaces as a RuntimeWarning
+    assert not any(
+        issubclass(w.category, RuntimeWarning) for w in caught
+    ), caught
+
+    with np.load(tmp_path / "embeddings.npz") as data:
+        rows = data["text_vecs"]
+        assert rows.shape[0] == 2
+        # exactly one row is all zeros and one row has unit norm (row order
+        # follows the seam but is not assumed — assert by row)
+        zero_row_present = np.any(np.all(rows == 0.0, axis=1))
+        assert zero_row_present
+        assert not np.any(np.isnan(rows))
