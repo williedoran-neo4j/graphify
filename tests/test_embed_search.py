@@ -522,6 +522,102 @@ def test_semantic_search_absent_sidecar_returns_embed_instruction(tmp_path):
     )
 
 
+def _write_sidecar_with_ghost(tmp_path: Path) -> Path:
+    """Sidecar carrying the 3 fixture ids PLUS a 4th row ``z-ghost`` whose id is
+    ABSENT from the graph — the C2.11 stale-row fixture. ``z-ghost``'s vector
+    reuses e0 (n-a-01's identity row), so under the canonical stub embed
+    (score_j == q[j]) it scores EXACTLY 1.0 — above the tool's default
+    min_score=0.3 and inside the default top_k=10 (4 rows < 10). It must
+    actually SURVIVE top_k/min_score or the row is filtered before the render
+    and the C2.11 lock could only pass vacuously."""
+    (tmp_path / "graph.json").write_text(json.dumps({"directed": True, "nodes": [], "edges": []}))
+    meta = {
+        "model": "nomic-embed-text",
+        "backend": "ollama",
+        "dim": _STUB_DIM,
+        "graphify_version": "test",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    }
+    vecs = np.vstack([_ORTHO, _ORTHO[0]])  # the ghost reuses e0 -> score exactly 1.0
+    assert vecs.shape == (len(IDS) + 1, _STUB_DIM)
+    path = tmp_path / "embeddings.npz"
+    np.savez(
+        path,
+        text_ids=np.array([*IDS, "z-ghost"], dtype=str),
+        text_vecs=vecs,
+        text_meta=json.dumps(meta),
+    )
+    return path
+
+
+def test_semantic_search_stale_sidecar_row_renders_not_errors(tmp_path):
+    """C2.11/F2 (TEST-ONLY lock) — a sidecar row whose id is ABSENT from the
+    graph renders id-as-label with an empty ``()`` file_type suffix instead of
+    raising KeyError (which call_tool aliases into an
+    "Error executing semantic_search: ..." string).
+
+    The ``G.nodes.get(r['id'], {})`` join ALREADY landed with C2.8
+    (serve.py:1962-1963) — it is unchanged on this cycle, so the test passes on
+    first run (GREEN-ON-ARRIVAL) and the MUTATOR proves teeth by reverting the
+    join to ``G.nodes[r['id']]``: the stale ``z-ghost`` row then raises
+    ``KeyError``, call_tool's alias (serve.py:2064) renders
+    "Error executing semantic_search: 'z-ghost'", and BOTH the no-error assert
+    and the exact stale-line assert go red.
+
+    Sole-reason premise (no vacuous pass): ``z-ghost`` scores EXACTLY 1.0 (e0
+    reuse, score_j == q[j]) — above the tool's default min_score=0.3 and within
+    the default top_k=10 — so it genuinely reaches the render. The discriminator
+    substrings are exact: the aliased error text
+    "Error executing semantic_search: 'z-ghost'" contains the bare "z-ghost" but
+    NOT the doubled-space render "  z-ghost  z-ghost  ()"; and a broken
+    implementation that filtered the stale row pre-render (min_score/top_k)
+    fails the exact stale-line assert. The pinned render regex ``\\(\\w+\\)``
+    cannot match the empty ``()`` suffix, so the stale line is asserted with its
+    own exact literal while the 3 real rows stay on the pinned surface.
+    """
+    _write_sidecar_with_ghost(tmp_path)  # ids = 3 fixture ids + z-ghost
+    server = serve_mod._build_server(str(_graph_file(tmp_path)))  # graph keeps only the 3 real nodes
+    result_text = _invoke_semantic_search(server, query="query")
+
+    assert "Error executing" not in result_text, (
+        f"the stale row must never surface call_tool's exception alias; got {result_text!r}"
+    )
+    lines = result_text.splitlines()
+    assert len(lines) == 4, (
+        f"3 real rows + the stale z-ghost row must all render, got {lines!r}"
+    )
+
+    # The 3 real rows must still match the pinned C2.2 render surface (no
+    # regression); the stale row is the ONE line the pinned regex rejects
+    # (`\\(\\w+\\)` needs a word char, `()` has none).
+    pinned = r"(\d+\.\d{3})  \[text\]  (\S+)  (.+)  \((\w+)\)"
+    real_ids: list[str] = []
+    real_scores: list[float] = []
+    unmatched: list[str] = []
+    for line in lines:
+        m = re.fullmatch(pinned, line)
+        if m:
+            real_ids.append(m.group(2))
+            real_scores.append(float(m.group(1)))
+        else:
+            unmatched.append(line)
+    assert real_ids == ["n-b-02", "n-a-01", "n-c-03"], (
+        f"the 3 real rows must still render in the pinned descending order; "
+        f"got {real_ids!r}"
+    )
+    assert real_scores == sorted(real_scores, reverse=True), (
+        f"real-row scores must stay score-descending, got {real_scores!r}"
+    )
+    assert len(unmatched) == 1, (
+        f"exactly the stale row must fail the pinned regex, got {unmatched!r}"
+    )
+    stale_text = "1.000  [text]  z-ghost  z-ghost  ()"
+    assert unmatched[0] == stale_text, (
+        f"the stale row must render id-as-label with an empty () type, got "
+        f"{unmatched[0]!r}; expected the exact {stale_text!r}"
+    )
+
+
 def test_semantic_search_every_line_carries_space_text(tmp_path):
     """T10 (C2.10) — every rendered result line carries its `[text]` space
     token; the space literal is PER-LINE, not a one-occurrence-in-the-output
