@@ -23,6 +23,11 @@ from graphify.llm import (
 
 _TEXT_FILE_TYPES = frozenset({"document", "paper", "rationale", "concept"})
 
+# R4/C4.1 write-cache counters: corrupt entries are counted misses, hits are
+# counted hits (incremented by load_embedding only).
+_embed_cache_hits = 0
+_embed_cache_corrupt = 0
+
 
 def build_node_text(node: dict) -> str | None:
     """Return ``"{label}\n{source_file}"`` for a text-family node, else ``None``."""
@@ -156,3 +161,99 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
         text_meta=json.dumps(meta),
     )
     return npz_path
+
+
+# ---- R4/C4.1: two-namespace (backend, model) embedding write-cache ----
+#
+# Pinned by tests/test_embed_cache.py (RT9 namespace independence, RT11
+# corrupt-entry counted miss). Cache dir layout reuses cache.cache_dir's kind
+# namespacing; entries are ``{sha256(text)}.npy`` files holding a pickled raw
+# float vector. Write discipline mirrors cache.py's save_cached (mkstemp +
+# os.replace); corrupt entries mirror load_cached's counted-miss handling.
+
+def _embed_texts_key(backend: str, model: str) -> str:
+    """Return the cache ``kind``: ``f"embed-{backend}-{model}"`` (C4.1).
+    Single source of truth for BOTH the namespace separation and the prune glob."""
+    return f"embed-{backend}-{model}"
+
+
+def _embedding_cache_dir(root: Path, backend: str, model: str) -> Path:
+    """C4.1 — thin wrapper over ``cache.cache_dir`` for the embed kind."""
+    from graphify.cache import cache_dir
+
+    return cache_dir(root, kind=_embed_texts_key(backend, model))
+
+
+def load_embedding(
+    backend: str, model: str, text: str, root: Path
+) -> list[float] | None:
+    """C4.1 — load a cached embedding; miss/corrupt -> None (corrupt counted).
+
+    The entry is ``cache_dir(root, kind=embed-{backend}-{model}) /
+    {sha256(text)}.npy``. A missing entry is a plain miss; a present-but-
+    unparseable entry is a counted miss (``_embed_cache_corrupt``) that does
+    not raise and is left in place (mirrors cache.py's JSONDecodeError
+    discipline, #2405). A hit increments ``_embed_cache_hits``.
+    """
+    global _embed_cache_hits, _embed_cache_corrupt
+    import hashlib
+    import pickle
+
+    entry = _embedding_cache_dir(root, backend, model) / (
+        f"{hashlib.sha256(text.encode()).hexdigest()}.npy"
+    )
+    if not entry.exists():
+        return None
+    try:
+        vec = pickle.loads(entry.read_bytes())
+    except (pickle.UnpicklingError, EOFError, OSError):
+        _embed_cache_corrupt += 1
+        return None
+    if not isinstance(vec, (list, tuple)) or not all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) for x in vec
+    ):
+        # Payload unpickled but is not a flat sequence of numbers: not a
+        # usable vector, count it as corrupt.
+        _embed_cache_corrupt += 1
+        return None
+    _embed_cache_hits += 1
+    return list(vec)
+
+
+def save_embedding(
+    backend: str, model: str, text: str, vec: list[float], root: Path
+) -> None:
+    """C4.1 — atomically save an embedding (mkstemp + os.replace, pickle).
+
+    Stored bytes are the pickled RAW float vector (not numpy), so the entry
+    keyed by ``sha256(constructed text)`` stays valid regardless of a future
+    normalization or dtype change."""
+    import hashlib
+    import pickle
+    import tempfile
+
+    target_dir = _embedding_cache_dir(root, backend, model)
+    entry = target_dir / f"{hashlib.sha256(text.encode()).hexdigest()}.npy"
+    fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=entry.name, suffix=".tmp")
+    try:
+        os.write(fd, pickle.dumps(vec))
+        os.close(fd)
+        try:
+            os.replace(tmp_path, entry)
+        except PermissionError:
+            # Windows: os.replace can fail with WinError 5 if the target is
+            # briefly locked. Fall back to copy-then-delete.
+            import shutil
+
+            shutil.copy2(tmp_path, entry)
+            os.unlink(tmp_path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
