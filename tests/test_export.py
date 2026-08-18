@@ -866,6 +866,22 @@ def test_backup_env_disable(tmp_path, monkeypatch):
     assert backup_if_protected(tmp_path) is None
 
 
+def test_backup_semantic_marker_copies_embeddings_npz(tmp_path):
+    """.graphify_semantic_marker + graph.json + embeddings.npz → backup dir gets
+    embeddings.npz (R3/RT8/I8: `_BACKUP_ARTIFACTS` must preserve the text-space
+    embedding sidecar, which is expensive to regenerate, alongside graph.json)."""
+    import numpy as np
+    from graphify.export import backup_if_protected
+    (tmp_path / "graph.json").write_text('{"nodes":[],"links":[]}')
+    (tmp_path / ".graphify_semantic_marker").write_text('{"output_tokens": 1234}')
+    np.savez(tmp_path / "embeddings.npz", text_vecs=np.zeros((2, 4), dtype=np.float32))
+    result = backup_if_protected(tmp_path)
+    assert result is not None
+    assert result.is_dir()
+    assert (result / "graph.json").exists()
+    assert (result / "embeddings.npz").exists()
+
+
 def _mkG(n):
     import networkx as nx
     G = nx.Graph()

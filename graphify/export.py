@@ -28,6 +28,7 @@ _BACKUP_ARTIFACTS = [
     ".graphify_labels.json",
     ".graphify_analysis.json",
     "manifest.json",
+    "embeddings.npz",
     ".graphify_semantic_marker",
     "cost.json",
 ]
