@@ -47,6 +47,7 @@ from mcp.types import CallToolRequest, CallToolRequestParams  # noqa: E402
 from graphify import serve as serve_mod  # noqa: E402
 from graphify.embed import _STUB_DIM  # noqa: E402
 from graphify.search import load_sidecar, search_vectors  # noqa: E402
+import graphify.search as search_mod  # noqa: E402
 
 # Sorted-id order — the R1 sidecar rows live in this order (embed.py sorts).
 IDS = ("n-a-01", "n-b-02", "n-c-03")
@@ -302,4 +303,87 @@ def test_search_vectors_file_type_filter_reads_injected_lookup(tmp_path):
     assert [r["id"] for r in concept_rows] == ["n-b-02"]
     assert search_vectors(sidecar, "query", space="text", file_type=["audio"], file_type_lookup=real_lookup) == [], (
         "a file_type matching nothing must yield []"
+    )
+
+
+def _invoke_semantic_search(server, query="query", **extra):
+    """Invoke the semantic_search tool on the built server and return its text."""
+    arguments = {"query": query, **extra}
+    result_future = server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            params=CallToolRequestParams(name="semantic_search", arguments=arguments)
+        )
+    )
+    if asyncio.iscoroutine(result_future):
+        result = asyncio.run(result_future)
+    else:  # newer mcp majors may return an awaitable/wrapped result directly
+        result = result_future
+    return result.root.content[0].text
+
+
+def test_building_server_never_opens_embeddings_npz(tmp_path, monkeypatch):
+    """T14 guard — building a server (or merely listing tools) must NOT open the
+    embeddings sidecar; only an actual semantic_search invocation may read it.
+
+    Sole-reason premise: the only code path that may open the .npz is
+    search_vectors -> load_sidecar, and that runs exclusively inside the
+    semantic_search handler. If ANY of that path ran at build/list time, the
+    spy below records an open and the assertion fires. The observation is an
+    exact per-path open count, NOT an absent-from-result coarse check: nothing
+    else in the build intersects this path, so a single spurious open is
+    visible. Expected GREEN (the cache is C2.6's build — no build-time open
+    exists today); teeth are proven by a mutator adding an eager build-time
+    sidecar load.
+    """
+    _write_sidecar(tmp_path)
+    calls: list[str] = []
+    real_load_sidecar = search_mod.load_sidecar
+
+    def spy(path):
+        calls.append(str(path))
+        return real_load_sidecar(path)
+
+    monkeypatch.setattr(search_mod, "load_sidecar", spy)
+
+    serve_mod._build_server(str(_graph_file(tmp_path)))
+
+    assert calls == [], (
+        "building the server must never open embeddings.npz (lazy load); "
+        f"got {len(calls)} open(s): {calls}"
+    )
+
+
+def test_semantic_search_sidecar_loaded_once_across_repeated_calls(tmp_path, monkeypatch):
+    """C2.6 — the loaded sidecar is memoized ON THE GRAPH OBJECT, so two
+    semantic_search calls on the same server open the .npz exactly ONCE.
+
+    Sole-reason premise: the graph-object cache is the ONLY mechanism that can
+    dedupe the second call. The file is never rewritten between the calls, so
+    the (st_mtime_ns, st_size) key is identical for both — there is no disk
+    change for a per-call staleness re-read to notice. Today's handler calls
+    search_vectors fresh every invocation, load_sidecar fires on BOTH calls,
+    and this assertion fails — the red. If green were to dedupe in
+    graph-agnostic search.py's module scope instead, the key would not travel
+    with a hot-reloaded G (C2.11's constraint) and a module-level cache would
+    wrongly survive a fresh graph object — the graph-object placement is part
+    of the behavior under test.
+    """
+    _write_sidecar(tmp_path)
+    calls: list[str] = []
+    real_load_sidecar = search_mod.load_sidecar
+
+    def spy(path):
+        calls.append(str(path))
+        return real_load_sidecar(path)
+
+    monkeypatch.setattr(search_mod, "load_sidecar", spy)
+
+    server = serve_mod._build_server(str(_graph_file(tmp_path)))
+    first = _invoke_semantic_search(server)
+    second = _invoke_semantic_search(server)
+
+    assert "[text]" in first and "[text]" in second, "render must come from a real search"
+    assert len(calls) == 1, (
+        "the sidecar must be loaded ONCE and cached on the graph object; "
+        f"two semantic_search calls opened it {len(calls)} time(s): {calls}"
     )

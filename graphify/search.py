@@ -59,6 +59,7 @@ def search_vectors(
     min_score: float = 0.0,
     query_embed=_stub_query_embed,
     file_type_lookup: Callable[[str], str] = node_file_type,
+    preloaded: dict | None = None,
 ) -> list[dict] | None:
     """Rank the sidecar rows against the query, score-descending.
 
@@ -67,11 +68,13 @@ def search_vectors(
     absent. ``min_score`` drops rows strictly below the threshold before the
     ``file_type`` allow-set (each row's type resolved through the injected
     ``file_type_lookup``), then results are sorted score-descending and cut
-    to ``top_k``.``.
+    to ``top_k``.``. ``preloaded`` supplies already-loaded sidecar arrays so a
+    caller can memoize them across calls; when absent the sidecar is loaded
+    from ``path`` on every call (the graph-agnostic default).
     """
     import numpy as np
 
-    sidecar = load_sidecar(path)
+    sidecar = preloaded if preloaded is not None else load_sidecar(path)
     if sidecar is None:
         return None
     text_ids = sidecar["text_ids"]

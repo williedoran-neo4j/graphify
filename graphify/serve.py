@@ -1907,13 +1907,38 @@ def _build_server(graph_path: str):
         # line surface. Lazy import keeps numpy out of serve.py's module scope
         # (T14). The exact absent-sidecar text is C2.8's change; for now an
         # absent sidecar honestly reports no matches.
-        from graphify.search import search_vectors
+        #
+        # R2 C2.6: the loaded sidecar is memoized on the graph object (private
+        # G.graph key) keyed by the sidecar's (st_mtime_ns, st_size), mirroring
+        # _get_trigram_index's G.graph cache and _GraphContextCache's staleness
+        # key. Repeated calls on the same graph open the .npz once; a
+        # hot-reload that swaps in a fresh G naturally carries a fresh cache.
+        # search.py stays graph-agnostic — only the arrays cross, via the
+        # preloaded seam; the cache itself lives in the closure over G.
+        from graphify.search import load_sidecar, search_vectors
 
         query = arguments["query"]
         top_k = int(arguments.get("top_k", 10))
         file_type = arguments.get("file_type")
         min_score = float(arguments.get("min_score", 0.3))
         sidecar_path = Path(active_graph_path).parent / "embeddings.npz"
+        cache = G.graph.setdefault("_semantic_vectors", {})
+        key = None
+        preloaded = None
+        try:
+            stat_result = sidecar_path.stat()
+        except OSError:
+            stat_result = None
+        if stat_result is not None:
+            key = (stat_result.st_mtime_ns, stat_result.st_size)
+            entry = cache.get(sidecar_path)
+            if entry is not None and entry["key"] == key:
+                preloaded = entry["sidecar"]
+            else:
+                loaded = load_sidecar(sidecar_path)
+                if loaded is not None:
+                    preloaded = loaded
+                    cache[sidecar_path] = {"key": key, "sidecar": loaded}
         rows = search_vectors(
             sidecar_path,
             query,
@@ -1924,6 +1949,7 @@ def _build_server(graph_path: str):
             # C2.4: resolve each row's type through the live graph; search.py
             # stays graph-agnostic — only the callable crosses the boundary.
             file_type_lookup=lambda nid: G.nodes[nid].get("file_type", ""),
+            preloaded=preloaded,
         )
         if not rows:
             return "No semantic matches."  # absent sidecar / filtered-empty: C2.8 refines
