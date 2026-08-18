@@ -210,6 +210,47 @@ def test_search_vectors_min_score_drops_strictly_below_keeps_exact(tmp_path):
     )
 
 
+def test_search_vectors_top_k_cuts_after_ranking(tmp_path):
+    """T7 tail (C2.5) — the top_k cut happens AFTER ranking, so the survivors are
+    the top-SCORING rows (never the first-stored ones), and top_k=0 yields no
+    rows while the default returns everything.
+
+    Sole-reason lock: fixture rows are stored in sorted-id order
+    n-a-01(e0, score 1.0), n-b-02(e1, score 2.0), n-c-03(e2, score 0.5), so a
+    "cut the first N stored rows BEFORE ranking" implementation returns
+    [n-a-01, n-b-02] for top_k=2 — the WRONG ids (scores 1.0/2.0, not desc).
+    The top-two-scoring ids are [n-b-02, n-a-01] (scores 2.0/1.0), so asserting
+    exactly those ids (a real permutation of the first-two-stored) distinguishes
+    cut-after-ranking from cut-before-ranking. top_k=0 -> [] locks the empty-cut
+    boundary; the default (top_k=10) -> all 3 rows score-descending.
+    """
+    sidecar = _write_sidecar(tmp_path)
+    assert [r["id"] for r in search_vectors(sidecar, "query", space="text", top_k=2)] == [
+        "n-b-02",
+        "n-a-01",
+    ], "top_k must keep the top TWO SCORING ids, not the first two stored rows"
+    # top_k=1 pins the discriminator: the correct top-1 is n-b-02 (second-stored,
+    # q[1]=2.0 > q[0]=1.0), so a cut-then-resort implementation
+    # (sorted(rows[:top_k], reverse=True)) returns n-a-01 here and FAILS — the
+    # top_k=2 arm above cannot discriminate, because the top-2-scoring set
+    # happens to equal the first-2-stored set.
+    assert [r["id"] for r in search_vectors(sidecar, "query", space="text", top_k=1)] == [
+        "n-b-02",
+    ], "top_k=1 must keep the SINGLE top-scoring id (n-b-02), not the first stored row (n-a-01)"
+    assert search_vectors(sidecar, "query", space="text", top_k=0) == [], (
+        "top_k=0 must cut every row"
+    )
+    all_rows = search_vectors(sidecar, "query", space="text", top_k=10)
+    assert [r["id"] for r in all_rows] == ["n-b-02", "n-a-01", "n-c-03"], (
+        "top_k=10 must keep all rows in score-desc order"
+    )
+    assert [r["id"] for r in search_vectors(sidecar, "query", space="text")] == [
+        "n-b-02",
+        "n-a-01",
+        "n-c-03",
+    ], "the default top_k must keep all rows in score-desc order"
+
+
 def test_search_vectors_file_type_filter_reads_injected_lookup(tmp_path):
     """T9 — the file_type allow-set must be resolved through the INJECTED per-id
     lookup, never a hardcoded table and never `""`-for-everything.
