@@ -3,7 +3,7 @@
 Source spec: `/Users/williedoran/Dev/graphify-fork/docs/specs/2026-08-14-embedding-enrichment.md`
 Supersedes: `/Users/williedoran/Dev/graphify-fork/docs/specs/2026-08-17-embedding-enrichment-steelthread.md`
 (v1). v1's R1–R2 are **DONE**, committed, and locked by tests; this plan keeps
-those identifiers and renumbers the remaining scope into R3–R8 (one requirement
+those identifiers and renumbers the remaining scope into R3–R9 (one requirement
 per slice). This file is the authoritative spec for the work. §3 Contracts and
 §7 Invariants are cross-cutting — read them on **every** requirement.
 
@@ -49,11 +49,11 @@ observable capability per slice.
 
 > **Naming note.** DONE work tracks as "R1" (enrich → sidecar) and "R2"
 > (semantic_search tool) in commits and tests, and those identifiers are kept
-> here. The NOT-done surface is renumbered R3–R8, one requirement per slice.
+> here. The NOT-done surface is renumbered R3–R9, one requirement per slice.
 > v1's R4 (backup manifest) and v1's R7 (batching/LRU) fold into the new R3;
 > v1's R5 (rich text) → R5; v1's R6 (cache) → R4; v1's R9 (Neo4j) → R6; v1's
-> R10 (code space) → R7; v1's R11 (blend) → R8; v1's R8 (CLI) is a permanent
-> non-goal (see §2). New work only ever *adds to* or *extends* locked contracts.
+> R10 (code space) → R7; v1's R11 (blend) → R8; v1's R8 (CLI) → R9, now
+> scheduled (see §2). New work only ever *adds to* or *extends* locked contracts.
 
 ---
 
@@ -91,17 +91,18 @@ non-goal below — the §"Coverage self-audit" proves it. Nothing is dropped.
   selection, gated (weight zero → bit-identical scoring when no sidecar), lexical
   priority preserved (§6.2). Serial; gated by open question #2's unset blend
   weight.
+- **R9 — CLI entry points** — `graphify embed .` (standalone re-embed) and
+  `graphify extract . --embed` (embed after the graph is written), hand-rolled
+  `dispatch_command` wire + `--help` line + `_FREE_TEXT_CMDS` guard + zero-node
+  no-op (§6.3; C11). Serial, last — a CLI around a stub is false.
 
-**CLI (§6.3) — explicitly deferred, with a recorded trigger.** `graphify embed .`
-and `graphify extract . --embed` are deliberately **not** scheduled. `embed` is
-unreachable by a user today (it exists only as the absent-sidecar instruction
-text in `semantic_search`), and the incremental design that R4 introduces
-supersedes the "standalone re-embed" use the CLI exists for. Permanent deferral
-with a named re-entry trigger: a user-facing requirement that `graphify embed .`
-actually runnable, or any future slice that needs a CLI entry point to exercise
-enrich — at that point the CLI is a thin `dispatch_command` branch + help-line
-addition (v1's RT18–RT21). Until then it would carry an unexercised `--embed`
-flag and no consumer.
+**CLI (§6.3) — now scheduled as R9.** `graphify embed .` and
+`graphify extract . --embed` are **restored as a real requirement** by the
+user's decision — the previously-recorded re-entry trigger (a user-facing
+requirement that `graphify embed .` be runnable) has fired, and open question #4
+("CLI disposal") is resolved. R9 stays serial and last because it exposes the
+R3 real backend to a user; it is a thin `dispatch_command` branch + `--help`
+addition + a zero-node no-op guard, not a new capability shape of its own.
 
 **Permanent non-goals** (never built, §"Non-goals" + open question #3):
 
@@ -113,8 +114,12 @@ flag and no consumer.
 5. Chunking a node's body across multiple vectors. One vector per node.
 6. Vector-vs-graph staleness reconciliation (open question #3) — out of scope,
    consistent with the existing deferral of graph-staleness checking.
-7. The CLI (`graphify embed .` / `extract --embed`) — see the deferred-CLI note
-   above and open question #4.
+
+**(§6.3)** The CLI (`graphify embed .` / `extract --embed`) is **not** a
+non-goal. It is scheduled as **R9** (see §5/§8) — scope follows the original
+spec §6.3 + §10's `tests/test_embed_cli.py`, and the previous "recorded
+re-entry trigger" rationale is superseded by the user's decision to make the
+CLI real.
 
 ---
 
@@ -271,6 +276,22 @@ adds the `project_path` input property; `required` stays `["query"]`).
   rows above `min_score` and inside `top_k` renders both `[code]` and `[text]`
   lines (RT25), each space's rows score-descending within their space.
 
+### C11 — `graphify embed` / `extract --embed` CLI `[planned in R9]`
+
+Per §6.3, hand-rolled (no argparse subparsers): `__main__.py` reads
+`sys.argv[1]` and calls `dispatch_command` (`__main__.py:705`), help text as
+literal `print` calls.
+
+- `graphify embed .` — standalone re-embed of an existing graph.
+- `graphify extract . --embed` — embed as part of extraction, **after** the
+  graph is written.
+- `embed` is added to `dispatch_command` **and** to the `--help` block; it is
+  **not** added to `_FREE_TEXT_CMDS` (`__main__.py:704`), so the universal help
+  guard applies — `graphify embed --help` prints help and stops rather than
+  running.
+- A **zero-node graph → a clear no-op message**, not an error (§10
+  `tests/test_embed_cli.py`).
+
 ---
 
 ## 4. Test Targets (red-first)
@@ -280,7 +301,7 @@ green on first run, prove teeth by breaking the behavior (mutator), then keep as
 a standing regression guard. **[done]** = already implemented and green today
 (v1 R1–R2); never re-schedule.
 
-### The DONE thread — T1–T14 `[done]` (recorded; standing guards for R3–R8)
+### The DONE thread — T1–T14 `[done]` (recorded; standing guards for R3–R9)
 
 These live in `tests/test_embed_text.py`, `tests/test_embed.py`,
 `tests/test_embed_search.py`, `tests/test_embed_serve.py` and must stay green
@@ -385,6 +406,21 @@ through every slice:
 - RT28 [new] an exact-label lexical hit still ranks first when a semantic
   near-miss scores higher.
 
+### R9 — CLI entry points (C11, §6.3; §10 `tests/test_embed_cli.py`)
+
+The CLI is real behind the **real R3 backend** — not a stub — so these are
+`[new]`, unimplemented today. Phrased as observable outcomes, not plumbing:
+
+- RT29 [new] `graphify embed .` dispatches to the embed command (runs the
+  re-embed a user asked for).
+- RT30 [new] `graphify embed --help` prints help text rather than running —
+  the `_FREE_TEXT_CMDS` guard short-circuits before any embedding (observable:
+  exit/help printed, no embed side effects).
+- RT31 [new] `graphify extract . --embed` runs embedding after the graph is
+  written.
+- RT32 [new] both commands are **no-ops with a clear message** on a zero-node
+  graph — never an error.
+
 Manual acceptance (not unit-testable): against Aura, `db.index.vector.queryNodes`
 returns sensible neighbours for a natural-language query (I13) — a successful
 push alone does **not** count.
@@ -486,6 +522,23 @@ prove teeth by perturbing the blend), RT28 (new).
 Depends on R2 (done), R7. **Serial.** Blend weight deliberately unspecified
 (open question #2), gated closed by RT27 until measured.
 
+### Slice R9 — CLI entry points (C11, §6.3) — serial, last
+
+**Adds:** the one behavioral capability "the embed path must be runnable by a
+user": `graphify embed .` dispatches via `cli.dispatch_command`
+(`__main__.py:705`), `embed` is added to `dispatch_command` **and** the `--help`
+block **and not** to `_FREE_TEXT_CMDS` (so the universal help guard applies —
+RT30), `graphify extract . --embed` calls the embed path after the graph is
+written (RT31), and a zero-node graph produces a clear no-op message, never an
+error (RT32). Real behavior behind the real R3 backend — a CLI around a stub is
+false, because the user-facing contract is "the embed path actually runs end to
+end."
+**Driving tests (red):** RT29–RT32. **Keep green:** T4–T6 (the sidecar the CLI
+produces), T12 (the absent-sidecar instruction now names a runnable command),
+the whole done suite.
+**Done when:** RT29–RT32 pass from the real CLI and the done suite is green.
+Depends on R1 (done), R3. **Serial, last.**
+
 ### Slices sensitivity check (why no finer cut)
 
 - **Batching + query-embed LRU + backup manifest** fold into R3: all three are
@@ -497,10 +550,15 @@ Depends on R2 (done), R7. **Serial.** Blend weight deliberately unspecified
   (RT10) passes with minimal text.
 - **R6 + Aura acceptance** ship together: the queryNodes ability is R6's exit
   criterion, not a separate slice.
-- **R7 (code space) and R8 (blend)** each stay one capability; neither shares
-  slices with the other.
-- The final count is **6 slices** for the NOT-done surface, one per behavioral
-  capability; the CLI would have made a 7th but is a permanent non-goal (§2).
+- **R7 (code space), R8 (blend), and R9 (CLI)** each stay one capability;
+  neither shares slices with the others. Foldables don't exist even at 7
+  capabilities: `--help`/dispatch/zero-node behavior are one slice's four
+  observable outcomes, not candidates for their own slice, and each R9 target
+  below splits no slice-level decision.
+- The final count is **7 slices** for the NOT-done surface, one per behavioral
+  capability (backend, cache, rich text, Neo4j, code space, blend, CLI). That
+  is up from 6 by the user's decision to restore the CLI (§2); still down from
+  v1's 11.
 
 ---
 
@@ -533,6 +591,9 @@ Must stay serial (these move the boundaries themselves):
 - **R8 (query_graph blend)** — alters the `_score_query` scoring path (a
   contract) and is guarded by RT27's bit-identical regression test. Serial and
   gated; sequence after R7.
+- **R9 (CLI)** — exposes the real embed path to a user; it depends on R3's real
+  `_call_embeddings` and R1's sidecar write, so a wrong sequence (a CLI round a
+  stub) would lock a false shape. Serial and last; sequence after R3.
 
 Anything that would break an existing T1–T14/RT target is serial by definition.
 The DONE thread needs no parallel track — it is the finished core every track
@@ -622,6 +683,10 @@ marking the DONE ones `[x]`.
 - [ ] R8 — `query_graph` blend: semantic into `_score_query`, gated (weight 0 →
   bit-identical), lexical priority (C7, §6.2; RT27–RT28, I1)
   (depends: R2, R7; track: serial)
+- [ ] R9 — CLI: `graphify embed .` + `extract --embed` (dispatch_command and
+  `--help` block, `_FREE_TEXT_CMDS` guard so `--help` never runs, zero-node
+  no-op message: C11, §6.3; RT29–RT32)
+  (depends: R1, R3; track: serial)
 
 ---
 
@@ -680,8 +745,8 @@ score comparability claim → C10/R7 (RT25) + I4.
 
 **§6 Integration surfaces:** §6.1 schema/registration/project_path/sanitize
 labeling/absent-sidecar-instruction → C4, T11–T13 done; §6.2 blend + gating +
-lexical priority + open question #2 → C7/R8 (RT27/RT28); §6.3 CLI → permanent
-non-goal #7 + open question #4, with a recorded re-entry trigger.
+lexical priority + open question #2 → C7/R8 (RT27/RT28); §6.3 CLI → C11/R9
+(RT29–RT32; open question #4 resolved — see §2).
 
 **§7 Neo4j:** prop-filter silent list-drop + "four sites, one shared helper" +
 `bool`-before-`int` → C8/R6 (RT18–RT21); `embedding_code`/`embedding_text` +
@@ -718,24 +783,24 @@ sizing → I11/RT5; dim validation against `meta.dim` → I5/RT7; `OPENAI_BASE_U
   sanitize ✓ (T11); query_graph bit-identical → R8 (RT27); exact-label priority
   → R8 (RT28).
 - `test_embed_graphdb.py` — all §7 bullets → R6 (RT18–RT23).
-- `test_embed_cli.py` — §6.3 bullets → permanent non-goal #7 + open question
-  #4.
+- `test_embed_cli.py` — §6.3 bullets → C11/R9 (RT29–RT32).
 - Manual Aura acceptance → I13.
 
 **§11 Build order:** graphdb-first → R6 (parallel); llm → R3; cache → R4; embed
-text → R1 done; serve → R2 done + R8; cli → non-goal #7. R7 (code space) depends
-on R3+R5; R8 (blend) depends on R2+R7. Ordering preserves "tests pass before the
-next begins" by making every dependency explicit rather than implicit.
+text → R1 done; serve → R2 done + R8; cli → R9 (depends R1+R3). R7 (code space)
+depends on R3+R5; R8 (blend) depends on R2+R7. Ordering preserves "tests pass
+before the next begins" by making every dependency explicit rather than implicit.
 
 **§12 Open questions:** #1 (code model not pulled; dim variance absorbed by
 per-space `meta.dim` + separate indexes) → R7 (gated) + C5; #2 (blend weight
 unspecified) → R8 (gated by RT27); #3 (vector/graph staleness out of scope) →
-permanent non-goal #6; #4 (added here — CLI disposal) → permanent non-goal #7.
+permanent non-goal #6; #4 (CLI disposal — added in v2) → resolved: the CLI is
+scheduled as R9 per the user's decision.
 
 **What the previous v1 plan's §2 "Deferred" section had — and where it went:**
 real backend → R3; rich text → R5; second space → R7; embedding cache +
-incremental → R4; batching + LRU → R3; CLI → non-goal #7; query_graph blend →
-R8; Neo4j tier → R6; `.npz` in `_BACKUP_ARTIFACTS` → R3 (RT8); permanent
+incremental → R4; batching + LRU → R3; CLI → R9 (restored as a real requirement);
+query_graph blend → R8; Neo4j tier → R6; `.npz` in `_BACKUP_ARTIFACTS` → R3 (RT8); permanent
 non-goals → §2 #1–#7. Nothing from v1's deferred list (or the original spec) is
 dropped.
 
@@ -768,12 +833,12 @@ Target total, walking §4: 8 (R3) + 4 (R4) + 5 (R5) + 6 (R6) + 3 (R7) + 2 (R8) =
   literal (`[space]`), never by spacing beyond what's already locked; the text
   cap is pinned by what *survives* (the label), not a character count of the
   whole string.
-- **Slices vs. capabilities:** 6 slices = 6 behavioral capabilities (backend,
-  cache, rich text, Neo4j, code space, blend), one per slice; the CLI is a
-  permanent non-goal, so it does not inflate the count. That is down from
-  v1's 11. The audit found nothing further to fold: splitting R4 from R5, R6
-  from R3, or R7 from R8 would each yield a slice whose only content is a
-  single test name, which the skill forbids.
+- **Slices vs. capabilities:** 7 slices = 7 behavioral capabilities (backend,
+  cache, rich text, Neo4j, code space, blend, CLI), one per slice — up from
+  v1's 11, and 7 instead of 6 because the user restored the CLI (§2) as R9.
+  The audit found nothing further to fold: splitting R4 from R5, R6 from R3,
+  or R7 from R8 would each yield a slice whose only content is a single test
+  name, which the skill forbids.
 
 The plan is deliberately at this granularity; the check changes nothing.
 
