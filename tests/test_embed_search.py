@@ -699,3 +699,82 @@ def test_load_sidecar_validates_meta_dim_against_stored_rows(tmp_path):
     loaded = load_sidecar(matching)
     assert loaded is not None
     assert loaded["text_vecs"].shape == (len(IDS), _STUB_DIM)
+
+
+def _write_sidecar_model(tmp_path: Path, model: str) -> Path:
+    """A sidecar that differs from ``_write_sidecar`` ONLY in ``text_meta.model``.
+
+    Identical ids and orthonormal rows (so RT7's dim check passes), written into
+    its own subdirectory so ``_write_sidecar``'s ``embeddings.npz`` is untouched.
+    """
+    d = tmp_path / model
+    d.mkdir()
+    meta = {
+        "model": model,
+        "backend": "ollama",
+        "dim": _STUB_DIM,
+        "graphify_version": "test",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    }
+    path = d / "embeddings.npz"
+    np.savez(
+        path,
+        text_ids=np.array(IDS, dtype=str),
+        text_vecs=_ORTHO,
+        text_meta=json.dumps(meta),
+    )
+    return path
+
+
+def test_search_vectors_query_embed_lru_keyed_model_and_text(tmp_path):
+    """RT6 — the query-embed LRU is keyed ``(model, text)`` and is deduped
+    THROUGH ``search_vectors``: the same ``(model, text)`` embeds exactly ONCE
+    across repeated calls; a changed query text re-calls; the same text under a
+    DIFFERENT ``meta["model"]`` re-calls.
+
+    Sole-reason lock: today ``search_vectors`` invokes the injected
+    ``query_embed`` unconditionally on every call (search.py:99), so two calls
+    with the same text record TWO embed calls and the exact-payload assertion
+    fails — the red. The exact-payload sequence pins the KEY: a text-only cache
+    passes the two-call-one-call arm but FAILS the different-model arm (the
+    model2 "same phrase" would hit the model1 entry); a model-only cache FAILS
+    the changed-text arm. Only a cache keyed on ``(meta["model"], query)`` over
+    the injected seam reproduces the three payloads below.
+    """
+    sidecar = _write_sidecar(tmp_path)  # meta.model == "nomic-embed-text"
+    calls: list[tuple[str, str]] = []
+
+    def counting_embed(query, *, space, meta):
+        del space
+        calls.append((query, str(meta["model"])))
+        return [1.0, 2.0, 0.5, 0, 0, 0, 0, 0]
+
+    # Same (model, text) twice -> exactly ONE embedding call total.
+    search_vectors(sidecar, "same phrase", space="text", query_embed=counting_embed)
+    search_vectors(sidecar, "same phrase", space="text", query_embed=counting_embed)
+    assert len(calls) == 1, (
+        "the same (model, text) must embed exactly ONCE across repeated "
+        f"search_vectors calls; got {len(calls)} embed call(s): {calls}"
+    )
+
+    # A changed query text breaks the LRU entry -> re-call.
+    search_vectors(sidecar, "different phrase", space="text", query_embed=counting_embed)
+    assert len(calls) == 2, (
+        "a changed query text must re-call the embed; "
+        f"got {len(calls)} embed call(s): {calls}"
+    )
+
+    # The same text under a different recorded model must NOT hit the model1 entry.
+    other_sidecar = _write_sidecar_model(tmp_path, "text-embedding-3-small")
+    search_vectors(other_sidecar, "same phrase", space="text", query_embed=counting_embed)
+    assert len(calls) == 3, (
+        "the same text under a different meta.model must re-call the embed "
+        f"(the LRU key is (model, text)); got {len(calls)} embed call(s): {calls}"
+    )
+
+    # One embed per distinct (model, text) key — the RT6 discriminator.
+    assert calls == [
+        ("same phrase", "nomic-embed-text"),
+        ("different phrase", "nomic-embed-text"),
+        ("same phrase", "text-embedding-3-small"),
+    ], calls

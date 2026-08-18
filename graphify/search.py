@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import OrderedDict
 from collections.abc import Callable
 
 
@@ -20,6 +21,44 @@ def _stub_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
     # backend lands in R3; until then the query string is deliberately ignored.
     del query, space, meta
     return [1.0, 2.0, 0.5, 0, 0, 0, 0, 0]
+
+
+# C3.3/RT6: bounded (model, text) -> vector cache over the injected query_embed
+# seam. Keyed on CONTENTS (the sidecar's recorded model + the query string),
+# never on a graph object: a query embed is a pure function of (model, text),
+# so the entry survives — and stays correct across — hot-reloaded graphs, just
+# as preloaded/file_type_lookup cross that boundary. The LRU bound keeps the
+# cache from growing without limit.
+_QUERY_EMBED_CACHE: "OrderedDict[tuple[object, str], list[float]]" = OrderedDict()
+_QUERY_EMBED_MAXSIZE = 128
+
+
+def _embed_query_cached(
+    query_embed: Callable[..., list[float]],
+    query: str,
+    *,
+    space: str,
+    meta: dict,
+) -> list[float]:
+    """Query-embed invocation wrapped in a bounded ``(model, text)`` LRU (RT6).
+
+    The first search for a distinct ``(meta["model"], query)`` pair calls the
+    injected ``query_embed`` and memoizes the vector; an identical pair on a
+    later ``search_vectors`` call — same recorded model, same text — is served
+    from the cache without re-calling the seam. A changed text or a different
+    ``meta["model"]`` re-calls.
+    """
+    key = (meta.get("model"), query)
+    cached = _QUERY_EMBED_CACHE.get(key)
+    if cached is not None:
+        _QUERY_EMBED_CACHE.move_to_end(key)
+        return cached
+    cached = query_embed(query, space=space, meta=meta)
+    _QUERY_EMBED_CACHE[key] = cached
+    _QUERY_EMBED_CACHE.move_to_end(key)
+    if len(_QUERY_EMBED_CACHE) > _QUERY_EMBED_MAXSIZE:
+        _QUERY_EMBED_CACHE.popitem(last=False)
+    return cached
 
 
 def load_sidecar(path: str | os.PathLike) -> dict | None:
@@ -96,7 +135,10 @@ def search_vectors(
         meta = json.loads(str(sidecar["text_meta"]))
     except (ValueError, TypeError):
         meta = {}
-    q = np.asarray(query_embed(query, space=space, meta=meta), dtype=np.float32)
+    q = np.asarray(
+        _embed_query_cached(query_embed, query, space=space, meta=meta),
+        dtype=np.float32,
+    )
     scores = text_vecs @ q
     allow = set(file_type) if file_type else None
     rows = (
