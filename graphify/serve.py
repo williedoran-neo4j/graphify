@@ -1951,12 +1951,16 @@ def _build_server(graph_path: str):
             file_type_lookup=lambda nid: G.nodes[nid].get("file_type", ""),
             preloaded=preloaded,
         )
+        if rows is None:
+            # C2.8: absent sidecar (search_vectors returned None) -> the C4
+            # run-instruction; the filtered-empty case below keeps the old text.
+            return "No embeddings found for this graph. Run `graphify embed .` first."
         if not rows:
-            return "No semantic matches."  # absent sidecar / filtered-empty: C2.8 refines
+            return "No semantic matches."
         lines = [
             f"{r['score']:.3f}  [{r['space']}]  {sanitize_label(r['id'])}  "
-            f"{sanitize_label(G.nodes[r['id']].get('label', r['id']))}  "
-            f"({sanitize_label(G.nodes[r['id']].get('file_type', ''))})"
+            f"{sanitize_label(G.nodes.get(r['id'], {}).get('label', r['id']))}  "
+            f"({sanitize_label(G.nodes.get(r['id'], {}).get('file_type', ''))})"
             for r in rows
         ]
         return "\n".join(lines)

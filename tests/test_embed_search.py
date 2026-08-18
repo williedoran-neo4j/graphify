@@ -457,3 +457,66 @@ def test_semantic_search_neutralizes_control_char_in_rendered_label(tmp_path):
     assert re.fullmatch(
         r"(\d+\.\d{3})  \[text\]  (\S+)  (.+)  \((\w+)\)", lines[2]
     ), f"{lines[2]!r} no longer matches the pinned render surface"
+
+
+def test_semantic_search_absent_sidecar_returns_embed_instruction(tmp_path):
+    """T12 (C2.8) — a server pointed at a graph dir with NO embeddings.npz must
+    answer semantic_search with the run-`graphify embed .` instruction (C4:
+    "returns the literal instruction text to run ``graphify embed .`` ... NOT an
+    exception", spec lines 159-162) — never ``"No semantic matches."`` and never
+    an "Error executing ..." alias.
+
+    Sole-reason lock (the absent-vs-empty split): today the handler's single
+    ``if not rows:`` branch (serve.py:1954-1955) returns the EXACT
+    ``"No semantic matches."`` string for BOTH the absent-sidecar case
+    (``search_vectors`` returns ``None``) and the filtered-empty case
+    (``rows == []``). So under today's code:
+      * the literal-`graphify embed .` assertion FAILS (absent == the empty text);
+      * the NOT-``"No semantic matches."`` assertion FAILS (absent == that text);
+      * a raised/aliased exception is ALSO a failure now and after green: the
+        call_tool alias (serve.py:2060) rewrites every exception into
+        ``"Error executing semantic_search: ..."``, which contains no literal —
+        so only a successful tool result carrying the run-instruction can pass.
+    A blanket "handle absent == empty" implementation keeps absent equal to the
+    empty text and fails both asserts; only the None-seam split passes.
+    """
+    _graph_file(tmp_path)  # graph.json only — embeddings.npz ABSENT
+    server = serve_mod._build_server(str(Path(tmp_path).resolve() / "graph.json"))
+
+    # Direct handler-level red FIRST (no args besides the query): today this
+    # renders "No semantic matches." — the red is unpolluted by any exception
+    # alias, so this is the clean unimplemented-split failure.
+    assert "Error executing" not in _invoke_semantic_search(server, query="query"), (
+        "the absent-sidecar path must never produce the call_tool error alias — "
+        "but today the handler returns the empty text, so the 'Error executing' "
+        "absence alone cannot discriminate; the literal asserts below do"
+    )
+    # The load-bearing discriminators (the absent-vs-empty split is sole-reason):
+    assert "graphify embed ." in _invoke_semantic_search(server, query="query"), (
+        "absent sidecar must return the run-`graphify embed .` instruction; the "
+        "blanket 'No semantic matches.' fallback (today's code) fails this"
+    )
+    assert "No semantic matches." not in _invoke_semantic_search(server, query="query"), (
+        "the absent case must NOT render the empty-result text — today it does, "
+        "and a green that keeps absent == empty fails this"
+    )
+
+    # Absent-vs-empty discrimination through the ACTIVE MCP shape (call_tool's
+    # alias + project_path handling): the filter arm is C2.3's own min_score — a
+    # sidecar whose every score lies BELOW it renders the exact empty text, so
+    # the absent-instruction result cannot be "empty in pyjamas". (The fixture
+    # scores under the canonical stub embed are 2.0/1.0/0.5, so min_score=3.0
+    # filters ALL of them — same boundary value T8 uses for its empty arm.)
+    _write_sidecar(tmp_path)
+    filtered_empty = _invoke_semantic_search(server, query="query", min_score=3.0)
+    assert filtered_empty == "No semantic matches.", (
+        "present-but-filtered-empty must STILL render the EXACT empty text "
+        "(the split is symmetric — a green returning the instruction here fails)"
+    )
+    # Populated arm: the same server, same graph dir, a request that CLEARS the
+    # filter renders real rows — proving the sidecar is alive and the empty text
+    # above came from genuine filtering, not absence.
+    rows_text = _invoke_semantic_search(server, query="query", min_score=0.0)
+    assert "n-b-02" in rows_text and "[text]" in rows_text, (
+        f"with min_score cleared the sidecar must render real rows, got {rows_text!r}"
+    )
