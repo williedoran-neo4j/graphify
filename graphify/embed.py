@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from graphify.embeddings import EMBEDDING_BACKENDS
+
 _TEXT_FILE_TYPES = frozenset({"document", "paper", "rationale", "concept"})
 
 
@@ -35,8 +37,15 @@ def _call_embeddings(backend: str, model: str, inputs: list[str]) -> list[list[f
     """C2 seam (stub): deterministic per-input vectors, no HTTP.
 
     ``backend``/``model`` are opaque — recorded later in sidecar meta.
+    Non-supported backends fail fast naming the supported set (RT2).
     """
-    del backend, model  # opaque in the stub; surfaced via ``text_meta``
+    del model  # opaque in the stub; surfaced via ``text_meta``
+    if backend not in EMBEDDING_BACKENDS:
+        raise ValueError(
+            f"unsupported embedding backend {backend!r}; "
+            f"supported: {sorted(EMBEDDING_BACKENDS)}"
+            " (chat-only backends like claude do not serve embeddings)"
+        )
     return [[float(i + 1)] * _STUB_DIM for i in range(len(inputs))]
 
 
