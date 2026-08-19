@@ -22,7 +22,7 @@ from __future__ import annotations
 import networkx as nx
 import pytest
 
-from graphify.embed import build_node_text
+from graphify.embed import _NODE_TEXT_CAP_CHARS, _neighbour_text, build_node_text
 
 
 @pytest.fixture
@@ -157,3 +157,47 @@ def test_image_node_excluded(text_graph):
         "file_type": "image",
     }
     assert build_node_text(text_graph, "n-IMG-07", image_node) is None
+
+
+def test_build_node_text_rt14_cap_truncates_neighbour_tail():
+    """RT14 (C5.3) — the full constructed text is capped at
+    ``_NODE_TEXT_CAP_CHARS``; the cap truncates the NEIGHBOUR TAIL
+    (lowest-degree whole labels dropped) and never touches the first three
+    lines (label, path, empty rationale).
+
+    Fixture: short-label text-family node with 10 neighbours whose labels are
+    each ``NbLabel{k}_`` + ``"x"*200`` (209 chars) and whose degrees are
+    distinct (10..1), so the ``(-degree, id)`` sort is DEGREE-driven —
+    NbLabel0 is the highest-degree HEAD, NbLabel9 the lowest-degree TAIL. The
+    uncapped join (2099 chars) is computed through the C5.1-accepted
+    ``_neighbour_text(graph, nid, limit=10)`` seam, never hand-concatenated.
+    """
+    g = nx.Graph()
+    g.add_node(
+        "n-rt14",
+        id="n-rt14",
+        label="L",
+        source_file="docs/notes.md",
+        file_type="document",
+    )
+    for k in range(10):
+        g.add_node(
+            f"nb-{k}",
+            id=f"nb-{k}",
+            label=f"NbLabel{k}_" + ("x" * 200),
+            file_type="document",
+        )
+        g.add_edge("n-rt14", f"nb-{k}")
+
+    uncapped = build_node_text(g, "n-rt14", g.nodes["n-rt14"])
+    uncapped_neighbours = _neighbour_text(g, "n-rt14", limit=10)
+    assert len(uncapped_neighbours) > _NODE_TEXT_CAP_CHARS  # uncapped join 2099 chars
+
+    text = build_node_text(g, "n-rt14", g.nodes["n-rt14"])
+    lines = text.split("\n")
+
+    assert len(text) <= _NODE_TEXT_CAP_CHARS
+    assert text.split("\n")[:3] == uncapped.split("\n")[:3]
+    assert lines[3] != uncapped_neighbours and len(lines[3]) < len(uncapped_neighbours)
+    assert "NbLabel9" not in lines[3]
+    assert "NbLabel0_" in lines[3]

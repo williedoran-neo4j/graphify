@@ -40,6 +40,29 @@ def _neighbour_text(graph, nid: str, limit: int = 10) -> str:
     )[:limit]
     return " ".join(graph.nodes[nb].get("label", "") for nb in neighbours)
 
+# RT14 (C5.3) — cap on the FULL constructed build_node_text string. Only the
+# neighbour block shrinks (trailing whole labels dropped, character-trim as a
+# last resort); the label/path/rationale lines stay byte-intact.
+_NODE_TEXT_CAP_CHARS = 2000
+
+
+def _cap_neighbour_line(line: str, cap_chars: int) -> str:
+    """Cap the neighbour line to ``cap_chars`` characters.
+
+    Drops TRAILING whole labels while the space-joined remainder exceeds the
+    cap; if a single remaining label alone is still over cap, character-trims
+    that label's tail (whole-label drop first, char-trim last resort).
+    """
+    if len(line) <= cap_chars:
+        return line
+    tokens = line.split(" ")
+    while len(tokens) > 1:
+        kept = tokens[:-1]
+        if len(" ".join(kept)) <= cap_chars:
+            return " ".join(kept)
+        tokens = kept
+    return tokens[0][:cap_chars]
+
 # R4/C4.1 write-cache counters: corrupt entries are counted misses, hits are
 # counted hits (incremented by load_embedding only).
 _embed_cache_hits = 0
@@ -62,7 +85,9 @@ def build_node_text(graph, nid: str, node: dict) -> str | None:
     lines = [str(node.get("label", "")), path]
     rationale = node.get("rationale")
     lines.append(str(rationale) if rationale else "")
-    lines.append(_neighbour_text(graph, nid, limit=10))
+    neighbours = _neighbour_text(graph, nid, limit=10)
+    budget = max(0, _NODE_TEXT_CAP_CHARS - sum(len(line) for line in lines) - len(lines))
+    lines.append(_cap_neighbour_line(neighbours, budget))
     return "\n".join(lines)
 
 
