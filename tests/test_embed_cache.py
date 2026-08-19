@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import pickle
 import shutil
+from shutil import rmtree
 
 import numpy as np
 import pytest
@@ -126,7 +127,102 @@ def test_embed_cache_corrupt_entry_counted_miss_left_in_place(tmp_path):
     assert shape_bad_path.read_bytes() == shape_bad_bytes
 
 
-# ---- C4.2 — wire the cache into enrich_embeddings (RT10 zero-call re-run),
+# ---- R5/C5.2 — RT15: the rationale line (line 3) PRECEDES the neighbour
+# block, and a rationale-absent node falls back to label + source_file — as
+# they flow through the REAL enrich_embeddings + sha256(text) cache-key path.
+#
+# Expected GREEN-ON-ARRIVAL (revalidation): C5.1's accepted build_node_text
+# composes exactly this, so the lock passes on first run against the C5.2
+# pre-state. TEETH is about a naive constructor: a "rationale concatenated
+# AFTER the neighbour block" build would compose a DIFFERENT text for the
+# rationale node — the pre-seeded entry below (keyed on the constructed text)
+# would not hit, and the warm run's seam inputs would then contain the
+# rationale text, not just the fallback neighbour's. A "label+source_file only
+# when rationale absent" constructor would drop n-f's neighbour line, making
+# its expected full-string equality fail. Both mutations flip the test.
+
+
+def test_rt15_rationale_precedes_neighbour_block_via_cache_key(tmp_path, monkeypatch):
+    """RT15 — the rationale-when-present text and the rationale-absent
+    fallback, as observed at the cache-key seam of the REAL enrich_embeddings.
+
+    Two connected text-family documents: n-r (has ``rationale``) and n-f
+    (none). Cold run must call the seam with BOTH texts. Then the cache dir is
+    rmtree'd and ONLY n-r's entry is re-seeded — keyed on the constructed text
+    that carries the rationale on line 3. The warm run must:
+      - serve n-r from cache (its text — rationale BEFORE the neighbour block —
+        is the exact cache key), recording ZERO seam calls for it;
+      - miss n-f's entry and issue the ONLY warm seam call to its text, which
+        equals the exact fallback form
+        ``{label}\n{source_file}\n\n{_neighbour_text(...)}``.
+
+    The two behaviors are SEPARATELY pinned: deleting the n-r pre-write would
+    still leave the cold-rationale-order assertions exact, while any
+    rationale-after-neighbour (or fallback dropping the neighbour line)
+    constructor breaks the n-r cache hit and/or the n-f exact text.
+    """
+    import graphify.embed as _embed
+    from graphify.embed import (
+        _embedding_cache_dir,
+        _neighbour_text,
+        build_node_text,
+        enrich_embeddings,
+        save_embedding,
+    )
+
+    g = _graph(
+        {
+            "id": "n-r",
+            "label": "API Tokens",
+            "source_file": "docs/security.md",
+            "rationale": "credentials policy guidance",
+            "file_type": "document",
+        },
+        {
+            "id": "n-f",
+            "label": "Embedding math",
+            "source_file": "docs/embeddings.md",
+            "file_type": "document",
+        },
+    )
+    g.add_edge("n-r", "n-f")
+    graph_path = tmp_path / "graph.json"
+
+    # Reference construction (documented C2 lines): L3 = rationale (line 3,
+    # BEFORE the neighbour line) for n-r; L3 = "" for n-f.
+    ref_rationale_text = (
+        f"API Tokens\ndocs/security.md\ncredentials policy guidance\n{_neighbour_text(g, 'n-r')}"
+    )
+    ref_fallback_text = f"Embedding math\ndocs/embeddings.md\n\n{_neighbour_text(g, 'n-f')}"
+
+    # The seam records inputs only; the real embedding skeleton (dim 1) stays.
+    calls: list = []
+    _broadcast_spy_embeddings(monkeypatch, calls)
+    enrich_embeddings(g, graph_path)
+
+    # Cold run: BOTH texts reach the cache-key seam — the cache held nothing
+    # (list order is enrich's sorted-id iteration, an irrelevant detail here).
+    assert len(calls) == 1
+    cold_inputs = set(list(kwargs["inputs"] for _, kwargs in calls)[0])
+    assert cold_inputs == {ref_rationale_text, ref_fallback_text}
+
+    # Kill the cache, re-seed ONLY n-r's entry — keyed on the constructed text
+    # with the rationale on line 3.
+    rmtree(_embedding_cache_dir(tmp_path, "ollama", "nomic-embed-text"))
+    save_embedding("ollama", "nomic-embed-text", ref_rationale_text, [1.0], root=tmp_path)
+
+    # Warm run: n-r hits (exact key), n-f misses — the ONLY seam call is n-f's
+    # exact fallback text. A rationale-after-neighbour constructor's n-r text
+    # would NOT be the pre-write's key and would therefore leak into this list.
+    calls.clear()
+    enrich_embeddings(g, graph_path)
+    assert len(calls) == 1, calls
+    warm_inputs = list(kwargs["inputs"] for _, kwargs in calls)[0]
+    assert warm_inputs == [ref_fallback_text]
+
+    # Sanity: the constructor on disk composes the exact texts above.
+    assert build_node_text(g, "n-r", g.nodes["n-r"]) == ref_rationale_text
+    assert build_node_text(g, "n-f", g.nodes["n-f"]) == ref_fallback_text
 # prune_embedding_cache (RT12), and clear_cache's embed kinds (C4.3 folded).
 #
 # RT10's discriminating leg: with the cache dir rm -rf'd between runs, the
