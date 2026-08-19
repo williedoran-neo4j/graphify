@@ -1,8 +1,11 @@
-"""Embedding enrichment — R1 minimal text-space sidecar.
+"""Embedding enrichment — text-space sidecar.
 
-C1.1 implements build_node_text, a pure and deterministic text-family selector.
-The real text family is fixed here in R1 as the source of truth; ``code`` and
-``image`` are excluded (code is reserved for R10, image for every space).
+C2 (R5) composes ``build_node_text(graph, nid, node)`` into a deterministic
+4-line text — ``{label}``, ``{source_file}`` optionally qualified with
+``:{source_location}``, the ``{rationale}`` when present (else an empty line),
+and a space-joined line of up to 10 neighbour labels sorted by
+``(-degree, id)`` — while ``image`` (and every other non-text-family type) is
+excluded from every space.
 
 R3 (C3.2): the ``_call_embeddings`` seam is real — it calls the backend's
 OpenAI-compatible embeddings API in batches of ``_EMBED_BATCH_SIZE`` (100)
@@ -21,7 +24,21 @@ from graphify.llm import (
     _resolve_max_retries,
 )
 
-_TEXT_FILE_TYPES = frozenset({"document", "paper", "rationale", "concept"})
+_TEXT_FILE_TYPES = frozenset({"document", "paper", "rationale", "concept", "code"})
+
+
+def _neighbour_text(graph, nid: str, limit: int = 10) -> str:
+    """Return the space-joined neighbour labels of ``nid``, highest-degree first.
+
+    Sorted by ``(-graph.degree[nb], nb)`` and truncated to ``limit`` labels;
+    each label is the neighbour node's own ``label`` attribute (not its id).
+    The line is emitted even when there are no neighbours (an empty string).
+    """
+    neighbours = sorted(
+        graph.neighbors(nid),
+        key=lambda nb: (-graph.degree[nb], nb),
+    )[:limit]
+    return " ".join(graph.nodes[nb].get("label", "") for nb in neighbours)
 
 # R4/C4.1 write-cache counters: corrupt entries are counted misses, hits are
 # counted hits (incremented by load_embedding only).
@@ -29,11 +46,24 @@ _embed_cache_hits = 0
 _embed_cache_corrupt = 0
 
 
-def build_node_text(node: dict) -> str | None:
-    """Return ``"{label}\n{source_file}"`` for a text-family node, else ``None``."""
+def build_node_text(graph, nid: str, node: dict) -> str | None:
+    """Compose a text-family node's deterministic 4-line embedding text.
+
+    ``{label}`` / ``{source_file}[:{source_location}]`` / ``{rationale}`` (only
+    when present) / the neighbour line from ``_neighbour_text`` — joined with
+    ``"\\n"``. Returns ``None`` for any non-text-family type.
+    """
     if node.get("file_type") not in _TEXT_FILE_TYPES:
         return None
-    return f"{str(node.get('label', ''))}\n{str(node.get('source_file', ''))}"
+    path = str(node.get("source_file", ""))
+    loc = node.get("source_location")
+    if loc:
+        path = f"{path}:{str(loc)}"
+    lines = [str(node.get("label", "")), path]
+    rationale = node.get("rationale")
+    lines.append(str(rationale) if rationale else "")
+    lines.append(_neighbour_text(graph, nid, limit=10))
+    return "\n".join(lines)
 
 
 _STUB_DIM = 8
@@ -131,7 +161,7 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
     ids: list[str] = []
     for nid in sorted(graph.nodes):
         attrs = graph.nodes[nid]
-        text = build_node_text(attrs)
+        text = build_node_text(graph, str(nid), attrs)
         if text is not None:
             ids.append(str(nid))
             texts.append(text)
