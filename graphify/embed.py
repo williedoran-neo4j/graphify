@@ -141,10 +141,37 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
     except Exception:
         graphify_version = "unknown"
 
-    vecs = np.asarray(
-        _call_embeddings(backend="ollama", model="nomic-embed-text", inputs=texts),
-        dtype=np.float32,
-    )
+    # R4/C4.2 — serve hits from the embed write-cache first; only MISSING
+    # texts reach the seam. root anchors graphify-out/ (Path(graph_path).parent).
+    # Zero texts (or an all-hit set) never calls ``_call_embeddings``.
+    backend, model = "ollama", "nomic-embed-text"
+    cache_root = Path(graph_path).parent
+    cached: list[list[float] | None] = []
+    missing_texts: list[str] = []
+    for text in texts:
+        vec = load_embedding(backend, model, text, cache_root)
+        cached.append(vec)
+        if vec is None:
+            missing_texts.append(text)
+
+    if missing_texts:
+        rebuilt = _call_embeddings(backend=backend, model=model, inputs=missing_texts)
+    else:
+        rebuilt = []
+
+    # Reassemble the full matrix in text order (hits + rebuilt rows).
+    vec_rows: list[list[float]] = []
+    rebuilt_iter = iter(rebuilt)
+    for vec in cached:
+        if vec is not None:
+            vec_rows.append(vec)
+        else:
+            vec_rows.append(next(rebuilt_iter))
+    _guard_dim_consistency(vec_rows)
+    for text, vec in zip(missing_texts, rebuilt):
+        save_embedding(backend, model, text, vec, cache_root)
+
+    vecs = np.asarray(vec_rows, dtype=np.float32)
     meta = {
         "model": "nomic-embed-text",
         "backend": "ollama",
@@ -257,3 +284,37 @@ def save_embedding(
         except OSError:
             pass
         raise
+
+
+def prune_embedding_cache(
+    root: Path, backend: str, model: str, live_texts: set[str]
+) -> int:
+    """R4/C4.2 — remove orphaned embed-cache entries, returning the count pruned.
+
+    Mirror of ``prune_semantic_cache`` (cache.py), applied to the
+    ``embed-{backend}-{model}`` namespace: base-anchored at ``_GRAPHIFY_OUT``,
+    glob ``**/*.npy``, delete any entry whose stem (the ``sha256(text)`` key)
+    is not in ``{sha256(t) for t in live_texts}``. ``*.tmp`` atomic-write
+    temporaries are skipped. Best-effort per unlink (``try/except OSError``).
+    NOT wired into ``enrich_embeddings`` — the standalone re-embed CLI owns the
+    call site."""
+    import hashlib
+
+    from graphify.cache import _GRAPHIFY_OUT
+
+    _out = Path(_GRAPHIFY_OUT)
+    base = _out if _out.is_absolute() else Path(root).resolve() / _out
+    live_hashes = {hashlib.sha256(t.encode()).hexdigest() for t in live_texts}
+    cache_dir = base / "cache" / _embed_texts_key(backend, model)
+    if not cache_dir.is_dir():
+        return 0
+    pruned = 0
+    for entry in cache_dir.glob("**/*.npy"):
+        if entry.stem in live_hashes:
+            continue
+        try:
+            entry.unlink()
+            pruned += 1
+        except OSError:
+            pass
+    return pruned

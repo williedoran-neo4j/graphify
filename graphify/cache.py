@@ -1068,6 +1068,12 @@ def clear_cache(root: Path = Path(".")) -> None:
         if d.is_dir():
             for f in d.glob("**/*.json"):
                 f.unlink()
+    # Embed kinds (R4/C4.2): a switched-away (backend, model) namespace must
+    # not accumulate forever — swept as **/*.npy per embed-{backend}-{model} dir.
+    for d in base.glob("embed-*"):
+        if d.is_dir():
+            for f in d.glob("**/*.npy"):
+                f.unlink()
 
 
 def prune_semantic_cache(root: Path, live_hashes: set[str]) -> int:

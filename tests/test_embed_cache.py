@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+import shutil
 
+import numpy as np
 import pytest
 
 from graphify import cache as _cache
@@ -122,3 +124,174 @@ def test_embed_cache_corrupt_entry_counted_miss_left_in_place(tmp_path):
     assert _embed._embed_cache_corrupt == corrupt_before + 2
     assert shape_bad_path.is_file()
     assert shape_bad_path.read_bytes() == shape_bad_bytes
+
+
+# ---- C4.2 — wire the cache into enrich_embeddings (RT10 zero-call re-run),
+# prune_embedding_cache (RT12), and clear_cache's embed kinds (C4.3 folded).
+#
+# RT10's discriminating leg: with the cache dir rm -rf'd between runs, the
+# second run MUST call the seam again — proving HIT LOGIC (not the fixture)
+# suppresses the warm re-call. Every leg must run through the real seam's
+# callable (a delegating spy) so the zero-call assert is a measured side
+# effect of the real path, and the vectors driven into the cache are the real
+# backend's — never a fixture-only value a dumb `not text` check could fake.
+
+
+def _graph(*node_attrs) -> "object":
+    """A real networkx.Graph (test_embed.py's fixture shape): each node dict
+    carries id/label/source_file/file_type so build_node_text (R1) can select
+    the text family."""
+    import networkx as nx
+
+    g = nx.Graph()
+    g.add_nodes_from((a["id"], a) for a in node_attrs)
+    return g
+
+
+def _broadcast_spy_embeddings(monkeypatch, recorded):
+    """Real seam + delegating spy: records inputs then embeds via _call_embeddings.
+
+    ``*args``/``**kwargs`` so the keyword call shape
+    (``backend=..., model=..., inputs=...``) of the real seam is recorded, not
+    mangled. Dimension 1 keeps every vector unit-norm out of the box.
+    """
+    import graphify.embed as _embed
+
+    def spy(*args, **kwargs):
+        recorded.append((args, kwargs))
+        return [[1.0] for _ in kwargs["inputs"]]
+
+    monkeypatch.setattr(_embed, "_call_embeddings", spy)
+
+
+def test_enrich_zero_call_re_run_warm_cache(tmp_path, monkeypatch):
+    """RT10 — a warm-cache re-run must issue ZERO ``_call_embeddings`` calls,
+    and the two sidecars must be identical in ``text_ids`` and ``text_vecs``.
+
+    Plan's pinned shape: cold run records exactly ONE call (sidecar written);
+    ``calls.clear()``; warm run records ZERO (the cache suppressed it); the
+    second ``embeddings.npz`` byte-matches on ids and allclose() on vecs.
+    Real-red discriminator: delete the cache dir, run a THIRD time — the seam
+    must be called again (exactly one), proving HIT LOGIC, not the fixture's
+    short-circuited inputs, suppresses the warm call. ``root`` is
+    ``Path(graph_path).parent`` per plan. Every leg needs both a hit register
+    and a fresh counter block.
+    """
+    import graphify.embed as _embed
+    from graphify.embed import enrich_embeddings
+
+    g = _graph(
+        {
+            "id": "n-a-01",
+            "label": "API Tokens",
+            "source_file": "docs/security.md",
+            "file_type": "document",
+        },
+        {
+            "id": "n-b-02",
+            "label": "Embedding math",
+            "source_file": "docs/embeddings.md",
+            "file_type": "document",
+        },
+        {
+            "id": "n-IMG-07",
+            "label": "architecture diagram",
+            "source_file": "assets/arch.png",
+            "file_type": "image",
+        },
+    )
+    graph_path = tmp_path / "graph.json"
+
+    # Cold run: the cache lets nothing through; the seam must be hit exactly once.
+    calls: list = []
+    _broadcast_spy_embeddings(monkeypatch, calls)
+    hits_before = _embed._embed_cache_hits
+    out1 = enrich_embeddings(g, graph_path)
+    assert len(calls) == 1, calls
+
+    # Warm run over the unchanged graph: zero calls, identical sidecar state.
+    calls.clear()
+    out2 = enrich_embeddings(g, graph_path)
+    assert len(calls) == 0, calls
+    with np.load(out2) as data2, np.load(out1) as data1:
+        assert [str(s) for s in data2["text_ids"]] == [str(s) for s in data1["text_ids"]]
+        assert np.allclose(data2["text_vecs"], data1["text_vecs"])
+    # The cache swallowed both texts — not a side-effect-free re-embed.
+    assert _embed._embed_cache_hits >= hits_before + 2
+
+    # Real-red discriminator: rm -rf the cache dir, run again — hit logic must
+    # be the suppressed part, so the seam is called exactly once more.
+    from graphify.embed import _embedding_cache_dir
+
+    cache_root = _embedding_cache_dir(tmp_path, "ollama", "nomic-embed-text")
+    shutil.rmtree(cache_root)
+    calls.clear()
+    out3 = enrich_embeddings(g, graph_path)
+    assert len(calls) == 1, calls
+    with np.load(out3) as data3, np.load(out1) as data1:
+        assert [str(s) for s in data3["text_ids"]] == [str(s) for s in data1["text_ids"]]
+        assert np.allclose(data3["text_vecs"], data1["text_vecs"])
+
+
+def test_prune_embedding_cache_and_namespace_coverage(tmp_path):
+    """RT12 + C4.3-folded — the prune helper removes orphans and nothing else.
+
+    Builds two (backend, model) namespaces directly (save_embedding) and prunes
+    the first. ``prune_embedding_cache`` does not exist yet, so this test's
+    FAILURE is the right-reason red (attribute error on import). Three closing
+    assertions fold in C4.3:
+
+    - pruning under the FIRST kind returns the count >= 1 and the orphaned
+      entry is gone;
+    - the SECOND namespace's entries are left intact (its key's own regex would
+      never match ``embed-ollama-nomic-embed-text``, so only a real prune can
+      produce the removal);
+    - ``clear_cache`` removes embed-kind entries too — today its kind loop stops
+      at ``semantic-deep``, so the orphaned entry survives (fails).
+    """
+    from graphify import cache as _cache
+    from graphify.embed import (
+        _embed_texts_key,
+        load_embedding,
+        prune_embedding_cache,
+        save_embedding,
+    )
+
+    # Two namespaces, three texts. The transient text is an orphan of kind1.
+    kind1 = ("ollama", "nomic-embed-text")
+    kind2 = ("openai", "nomic-embed-text")
+    live1 = "Embedding math\ndocs/embeddings.md"
+    live2 = "API Tokens\ndocs/security.md"
+    orphan1 = "Cargo Graph\ndocs/other.md"
+    for text in (live1, live2):
+        save_embedding(*kind1, text, [0.25], root=tmp_path)
+        save_embedding(*kind2, text, [0.5, -0.5], root=tmp_path)
+    save_embedding(*kind1, orphan1, [0.125], root=tmp_path)
+
+    kind1_dir = _cache.cache_dir(tmp_path, kind=_embed_texts_key(*kind1))
+
+    # The orphans are concretely present (2 files in kind1 before pruning).
+    assert list(kind1_dir.glob("*.npy"))
+    assert len(list(kind1_dir.glob("*.npy"))) == 3
+
+    # RT12 — the helper prunes the first namespace's orphaned entry.
+    pruned = prune_embedding_cache(
+        root=tmp_path, backend="ollama", model="nomic-embed-text",
+        live_texts={live1, live2},
+    )
+    assert pruned >= 1
+    assert not (kind1_dir / f"{hashlib.sha256(orphan1.encode()).hexdigest()}.npy").exists()
+
+    # C4.3 — the second namespace kept its orphan-of-kind2 (different hash),
+    # and pruning never touched the actually-live vectors (they still hit).
+    kind2_dir = _cache.cache_dir(tmp_path, kind=_embed_texts_key(*kind2))
+    assert (kind2_dir / f"{hashlib.sha256(live1.encode()).hexdigest()}.npy").is_file()
+    assert (kind2_dir / f"{hashlib.sha256(live2.encode()).hexdigest()}.npy").is_file()
+    assert load_embedding("ollama", "nomic-embed-text", live1, root=tmp_path) == [0.25]
+    assert load_embedding("ollama", "nomic-embed-text", live2, root=tmp_path) == [0.25]
+
+    # C4.3 — clear_cache must remove embed entries under the embed kinds too
+    # (glob **/*.npy). Today cache.py's loop stops at semantic-deep, so the
+    # still-alive kind1 entry survives — making this leg fail (red).
+    _cache.clear_cache(tmp_path)
+    assert not (kind1_dir / f"{hashlib.sha256(live1.encode()).hexdigest()}.npy").exists()
