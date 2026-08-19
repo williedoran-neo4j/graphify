@@ -391,3 +391,84 @@ def test_prune_embedding_cache_and_namespace_coverage(tmp_path):
     # still-alive kind1 entry survives — making this leg fail (red).
     _cache.clear_cache(tmp_path)
     assert not (kind1_dir / f"{hashlib.sha256(live1.encode()).hexdigest()}.npy").exists()
+
+
+# ---- R5/C5.4 — RT17, the cache-key trap test: an edit to file A changes the
+# constructed text of a node in file B whose neighbour label changed, so B's
+# cache entry misses and is rebuilt.
+#
+# Expected GREEN-ON-ARRIVAL (revalidation): R4 already keys the cache by
+# sha256(constructed text) and C5.1's build_node_text is already neighbour-
+# aware (B's text spells A's label via _neighbour_text), so both traps are
+# live on first run. TEETH: a source-file-hash key would serve BOTH A and B
+# from the old entries (neither file's bytes changed) and record ZERO warm
+# calls; a neighbour-ignorant text would leave B's text unchanged (B hits)
+# and record ONE warm input instead of two. Both flips break the count/set
+# assertions below.
+
+
+def test_rt17_edit_file_a_invalidates_neighbour_node_b_cache(tmp_path, monkeypatch):
+    """RT17 — an edit to file A invalidates the cache entry for BOTH A's node
+    (its own constructed text changed) and B's node (its neighbour line now
+    names A's new label) — observed at the seam of the REAL enrich_embeddings.
+
+    Two connected text-family nodes, each the other's ONLY neighbour (degree-1
+    sorts are trivial). COLD run over the initial graph calls the seam exactly
+    once with both ORIGINAL texts. Then A's label is edited (the test's stand-
+    in for a file-A edit): A's text changes on its label line AND B's text
+    changes because its neighbour line spells A's new label. The WARM re-run
+    over the same tmp_path must MISS both entries and issue exactly one seam
+    call carrying the two NEW texts.
+    """
+    from graphify.embed import _neighbour_text, enrich_embeddings
+
+    g = _graph(
+        {
+            "id": "n-a-01",
+            "label": "Token parse",
+            "source_file": "src/tokenizer.py",
+            "file_type": "code",
+        },
+        {
+            "id": "n-b-02",
+            "label": "Cargo graph",
+            "source_file": "src/graph_build.py",
+            "file_type": "code",
+        },
+    )
+    g.add_edge("n-a-01", "n-b-02")  # each is the other's ONLY neighbour
+    graph_path = tmp_path / "graph.json"
+
+    # Reference construction of the two ORIGINAL texts (label / path / empty
+    # rationale / neighbour line) — the neighbour line spells the other node.
+    ref_a_v1 = f"Token parse\nsrc/tokenizer.py\n\n{_neighbour_text(g, 'n-a-01')}"
+    ref_b_v1 = f"Cargo graph\nsrc/graph_build.py\n\n{_neighbour_text(g, 'n-b-02')}"
+
+    calls: list = []
+    _broadcast_spy_embeddings(monkeypatch, calls)
+    enrich_embeddings(g, graph_path)
+
+    # COLD run: cache empty -> ONE seam call carrying both ORIGINAL texts.
+    assert len(calls) == 1, calls
+    cold_inputs = set(list(kwargs["inputs"] for _, kwargs in calls)[0])
+    assert cold_inputs == {ref_a_v1, ref_b_v1}
+
+    # "Edit file A": change A node's label -> A's text changes on its label
+    # line, AND B's neighbour line now names A's NEW label, so B's text
+    # changes too without any edit to file B.
+    g.nodes["n-a-01"]["label"] = "New Token Parse"
+    ref_a_v2 = f"New Token Parse\nsrc/tokenizer.py\n\n{_neighbour_text(g, 'n-a-01')}"
+    ref_b_v2 = f"Cargo graph\nsrc/graph_build.py\n\n{_neighbour_text(g, 'n-b-02')}"
+    assert ref_a_v2 != ref_a_v1
+    assert ref_b_v2 != ref_b_v1  # the trap: B's text changed via its neighbour
+
+    # WARM re-run over the same cache dir: BOTH entries miss and the seam is
+    # called exactly once carrying the two NEW texts. A source-file-hash key
+    # (neither file's bytes changed) serves both from the OLD entries -> ZERO
+    # warm calls; a neighbour-ignorant text leaves B's text unchanged (B hits)
+    # -> ONE warm input, not two.
+    calls.clear()
+    enrich_embeddings(g, graph_path)
+    assert len(calls) == 1, calls
+    warm_inputs = set(list(kwargs["inputs"] for _, kwargs in calls)[0])
+    assert warm_inputs == {ref_a_v2, ref_b_v2}
