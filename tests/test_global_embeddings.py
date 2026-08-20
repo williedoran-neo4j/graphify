@@ -249,3 +249,137 @@ def test_cache_dedup_across_repos_shared_external_library_node(
             "repoA::requests",
             "repoB::api",
         ]
+
+
+def test_global_sidecar_no_bare_local_ids(tmp_path, monkeypatch):
+    """C6.3 — structural lock: the global sidecar's ``text_ids`` carry the
+    ``repo_tag::local_id`` form — never a bare local id — with no special-casing
+    (C12 third bullet, I14), on BOTH the write side and the fetch side.
+
+    Sole-reason fixture design per leg (every bare id in the SOURCE graphs is a
+    different string from both its namespaced row and its constructed text, so
+    no leg can pass unless the real prefixing is at work):
+
+    1. ``text_ids`` equals the exact NAMESPACED set — sorted rows
+       ``["repoA::architect", "repoA::requests", "repoB::gateway"]`` (set
+       equality with the namespaced ids, plus the exact-sorted-list shape). The
+       source graphs are written with BARE ids; only ``global_add`` +
+       ``enrich_embeddings`` can produce these rows.
+    2. No row of ``text_ids`` equals ANY repo's bare local id — membership
+       absence of ``{"architect", "requests", "gateway"}``. This is a separate
+       signal from leg 1: a drop-the-prefix mutant (bare rows) passes NOTHING
+       here, while a wrong-prefix mutant ("x::architect") passes leg 2 but fails
+       leg 1's exact equality — both mutants are needed for the sandwich.
+    3. Fetch-side proxy — the ``"repoA::requests" != "requests" != the text``
+       invariant made observable at the cache: the constructed text of the
+       namespaced external element ``repoA::requests`` is ``"HTTP requests\\n
+       \\n\\n"`` (never its bare id, never its namespaced id — the id never
+       enters the embedding path). Querying the REAL text-keyed cache
+       (``load_embedding``, which computes sha256(text) internally — the test
+       does NOT re-derive the key) proves a bare-id-shaped input and even a
+       namespaced-id-shaped input fetch NOTHING, while the text fetches the
+       cached vector. Then the whole cache is cleared and a re-embed re-fetches
+       the namespaced element under its text — the seam receives exactly the
+       three constructed texts, and the re-written sidecar is still the
+       namespaced set.
+    """
+    from graphify.global_graph import global_add, global_reembed
+    from graphify.embed import _embedding_cache_dir, build_node_text, load_embedding
+    import graphify.embed as _embed
+    from shutil import rmtree
+
+    # Two repos, three text-family nodes whose ids are BARE in the source files.
+    # The external code node carries NO source_file (matches global_add's
+    # external-label dedup shape) but its label is unique, so it is not deduped.
+    # One graph FILE per repo — each contains all of that repo's nodes.
+    repo_nodes: dict[str, list[tuple]] = {
+        "repoA": [
+            ("architect", "docs/arch.md", "Architecture", "document"),
+            ("requests", None, "HTTP requests", "code"),
+        ],
+        "repoB": [
+            ("gateway", "docs/gateway.md", "API gateway", "document"),
+        ],
+    }
+    for repo, nodes in repo_nodes.items():
+        G = nx.Graph()
+        for nid, src_file, label, ftype in nodes:
+            attrs = {"label": label, "file_type": ftype}
+            if src_file is not None:
+                attrs["source_file"] = src_file
+            G.add_node(nid, **attrs)
+        src = tmp_path / f"{repo}-graph.json"
+        src.write_text(
+            json.dumps(nx.node_link_data(G, edges="links")), encoding="utf-8"
+        )
+
+    global_dir = tmp_path / "global"
+    recorded: list = []
+
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"), \
+         patch("graphify.global_graph._GLOBAL_EMBEDDINGS", global_dir / "embeddings-global.npz"):
+        _broadcast_spy_embeddings(monkeypatch, recorded)
+
+        for repo in ("repoA", "repoB"):
+            global_add(tmp_path / f"{repo}-graph.json", repo)
+        result = global_reembed()
+        assert result["written"] is True
+        assert len(recorded) == 1, recorded
+
+        # Leg 1 — the exact namespaced rows (set equality vs the namespaced set,
+        # plus the exact sorted-list shape the sidecar pins).
+        expected_ids = ["repoA::architect", "repoA::requests", "repoB::gateway"]
+
+        # Leg 3 fixture premise, cross-checked against the REAL pipeline: the
+        # constructed texts are neither the bare ids nor the namespaced ids, so
+        # the later id-shaped cache-input negatives have teeth.
+        G_live = _embed_enriched_global_graph()
+        expected_texts = [
+            build_node_text(G_live, nid, G_live.nodes[nid]) for nid in expected_ids
+        ]
+        for nid, text in zip(expected_ids, expected_texts):
+            assert nid != text
+            assert nid.split("::", 1)[1] != text  # bare form != text too
+        assert recorded[0][1]["inputs"] == expected_texts
+
+        # Leg 2 — a text-keyed cache has no id dimension: the bare id can never
+        # fetch the namespaced element, and neither can the namespaced id.
+        assert (
+            load_embedding("ollama", "nomic-embed-text", "requests", root=global_dir)
+            is None
+        )
+        assert (
+            load_embedding("ollama", "nomic-embed-text", "repoA::requests", root=global_dir)
+            is None
+        )
+        # …only the constructed TEXT fetches it.
+        assert (
+            load_embedding(
+                "ollama", "nomic-embed-text", expected_texts[1], root=global_dir
+            )
+            == [1.0]
+        )
+
+        # Cold re-fetch after a full cache clear: the namespaced element is
+        # re-derived from its TEXT — the seam receives exactly the three
+        # constructed texts, never an id-shaped input.
+        rmtree(_embedding_cache_dir(global_dir, "ollama", "nomic-embed-text"))
+        recorded.clear()
+        assert global_reembed()["written"] is True
+        assert len(recorded) == 1, recorded
+        fetched = recorded[0][1]["inputs"]
+        assert fetched == expected_texts
+        assert set(fetched).isdisjoint({"architect", "requests", "gateway"})
+
+    sidecar = global_dir / "embeddings-global.npz"
+    assert sidecar.is_file()
+    with np.load(sidecar) as data:
+        rows = list(data["text_ids"])
+        # Leg 1 — equality with the exact namespaced set.
+        assert set(rows) == set(expected_ids)
+        assert rows == expected_ids
+        # Leg 2 — no row equals any repo's bare local id (membership absence).
+        for bare in ("architect", "requests", "gateway"):
+            assert bare not in rows
