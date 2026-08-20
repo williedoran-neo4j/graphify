@@ -14,6 +14,7 @@ list. This file is the R7 test home; the other slices live in
 from __future__ import annotations
 
 import inspect
+import re
 import sys
 import types
 
@@ -98,8 +99,18 @@ class _RecordingFalkorQuery:
 
 def _install_fake_neo4j(monkeypatch, log: list) -> None:
     """Point sys.modules['neo4j'] at a recording driver so push_to_neo4j runs
-    without a live server."""
+    without a live server. The fake also installs a minimal ``neo4j.exceptions``
+    module so a push that guards vector-index creation can import the driver's
+    exception types."""
     fake = types.ModuleType("neo4j")
+    exceptions_mod = types.ModuleType("neo4j.exceptions")
+
+    class _ClientError(Exception):
+        pass
+
+    exceptions_mod.ClientError = _ClientError
+    monkeypatch.setitem(sys.modules, "neo4j.exceptions", exceptions_mod)
+    fake.exceptions = exceptions_mod
 
     class _GraphDatabase:
         @staticmethod
@@ -108,6 +119,40 @@ def _install_fake_neo4j(monkeypatch, log: list) -> None:
 
     fake.GraphDatabase = _GraphDatabase
     monkeypatch.setitem(sys.modules, "neo4j", fake)
+
+
+def _install_fake_neo4j_ddl_failure(monkeypatch, log: list):
+    """Point sys.modules['neo4j'] at a recording driver whose session RAISES on
+    every CREATE VECTOR INDEX statement (after recording the query), so a test
+    can prove an index-creation failure never fails the push."""
+    fake = types.ModuleType("neo4j")
+    exceptions_mod = types.ModuleType("neo4j.exceptions")
+
+    class _ClientError(Exception):
+        pass
+
+    exceptions_mod.ClientError = _ClientError
+    monkeypatch.setitem(sys.modules, "neo4j.exceptions", exceptions_mod)
+    fake.exceptions = exceptions_mod
+
+    class _FailSession(_RecordingNeo4jSession):
+        def run(self, query, **params):
+            super().run(query, **params)
+            if "CREATE VECTOR INDEX" in query:
+                raise _ClientError("vector index not supported (simulated)")
+
+    class _FailDriver(_RecordingNeo4jDriver):
+        def session(self):
+            return _FailSession(self._log)
+
+    class _GraphDatabase:
+        @staticmethod
+        def driver(uri, auth=None):
+            return _FailDriver(log)
+
+    fake.GraphDatabase = _GraphDatabase
+    monkeypatch.setitem(sys.modules, "neo4j", fake)
+    return _ClientError
 
 
 def _install_fake_falkordb(monkeypatch, log: list) -> None:
@@ -358,3 +403,113 @@ def test_falkordb_embedding_props_L2_EQ_sidecar(monkeypatch, tmp_path):
         assert not [k for k in props if k.startswith("embedding_")], (
             f"node {pid} must carry no embedding prop without a sidecar"
         )
+
+
+def _integer_tokens(query: str) -> set[int]:
+    """All whole-number tokens in a query (grammar-agnostic)."""
+    return {int(m) for m in re.findall(r"\d+", query)}
+
+
+def test_vector_index_emitted_once_per_space_failure_non_fatal(
+    monkeypatch, tmp_path
+):
+    """A push with a sidecar must (a) mark each vector-carrying node with an
+    :Embedded label, (b) emit exactly one CREATE VECTOR INDEX ... IF NOT EXISTS
+    per embedding space, each reading its dimension from the sidecar meta, and
+    (c) never fail the push when an index creation errors -- the node MERGEs
+    must be recorded before any index DDL is attempted."""
+    import numpy as np
+
+    G = nx.Graph()
+    G.add_node("doc1", label="report", file_type="document")
+    G.add_node("code1", label="module.py", file_type="code")
+    G.add_node("no_vec", label="dashboard", file_type="concept")
+    G.add_edge("doc1", "code1", relation="references")
+
+    sidecar = tmp_path / "embeddings.npz"
+    np.savez(
+        sidecar,
+        text_ids=np.array(["doc1", "code1"]),
+        text_vecs=np.array(
+            [[0.5, -0.5, 1.0, 0.0], [0.0, 1.0, 0.5, -1.0]], dtype=np.float32
+        ),
+        text_meta=np.str_('{"dim": 4}'),
+    )
+
+    # Labels are carried on the same MERGE statements as the props the driver
+    # will execute; the node-MERGE query for a vector-carrying id must say
+    # SET n:Embedded, the absent-id node must not.
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    counts = push_to_neo4j(
+        G,
+        uri="bolt://localhost:7687",
+        user="neo4j",
+        password="pw",
+        embeddings_path=sidecar,
+    )
+    push_log = [(q, p) for kind, q, p in log if kind == "neo4j"]
+
+    label_queries = {
+        p["id"]: q
+        for q, p in push_log
+        if "SET n +=" in q and "SET n:Embedded" in q
+    }
+    assert "doc1" in label_queries
+    assert "code1" in label_queries
+
+    node_queries = {
+        p["id"]: q for q, p in push_log if "SET n +=" in q
+    }
+    assert "no_vec" in node_queries
+    assert "SET n:Embedded" not in node_queries["no_vec"]
+
+    # Exactly two index statements, one per space, each once, idempotent and
+    # dimensioned from the sidecar meta.
+    ddl = [q for q, _ in push_log if "CREATE VECTOR INDEX" in q]
+    assert ddl == [q for q, _ in push_log if "IF NOT EXISTS" in q]
+    assert len([q for q in ddl if "embedding_text" in q]) == 1
+    assert len([q for q in ddl if "embedding_code" in q]) == 1
+    text_ddl = next(q for q in ddl if "embedding_text" in q)
+    code_ddl = next(q for q in ddl if "embedding_code" in q)
+    assert 4 in _integer_tokens(text_ddl)
+    assert 4 in _integer_tokens(code_ddl)
+    assert "FOR (n:Embedded)" in text_ddl
+    assert "FOR (n:Embedded)" in code_ddl
+
+    # Non-fatal ordering: the DDL runs after the node MERGEs, and a DDL
+    # failure must not abort the push (counts still returned).
+    first_ddl_idx = min(
+        next(i for i, (qq, _) in enumerate(push_log) if qq == q) for q in ddl
+    )
+    last_node_merge_idx = max(
+        i for i, (qq, _) in enumerate(push_log) if "SET n +=" in qq
+    )
+    assert first_ddl_idx > last_node_merge_idx
+
+    fail_log = []
+    _install_fake_neo4j_ddl_failure(monkeypatch, fail_log)
+    fail_counts = push_to_neo4j(
+        G,
+        uri="bolt://localhost:7687",
+        user="neo4j",
+        password="pw",
+        embeddings_path=sidecar,
+    )
+    fail_push = [(q, p) for kind, q, p in fail_log if kind == "neo4j"]
+    fail_node_queries = {p["id"]: q for q, p in fail_push if "SET n +=" in q}
+    fail_node_labels = {
+        pid for pid, q in fail_node_queries.items() if "SET n:Embedded" in q
+    }
+    assert "doc1" in fail_node_labels and "code1" in fail_node_labels
+    # The node pushes already completed (and the labels landed); the index
+    # failures were swallowed rather than aborting the push.
+    assert fail_counts == counts
+
+    # Without a sidecar, neither the label nor any index statement appears.
+    no_sidecar_log = []
+    _install_fake_neo4j(monkeypatch, no_sidecar_log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+    no_sidecar_push = [(q, p) for kind, q, p in no_sidecar_log if kind == "neo4j"]
+    assert not [q for q, _ in no_sidecar_push if "CREATE VECTOR INDEX" in q]
+    assert not [q for q, _ in no_sidecar_push if "SET n:Embedded" in q]

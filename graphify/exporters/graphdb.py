@@ -1,6 +1,8 @@
 """graphdb — moved verbatim from graphify/export.py."""
 from __future__ import annotations
 
+import json
+
 from graphify.analyze import _node_community_map
 from graphify.embed import _embed_space
 from graphify.search import load_sidecar
@@ -27,6 +29,38 @@ def _embedding_index(embeddings_path):
         str(nid): {"text": row.tolist(), "code": row.tolist()}
         for nid, row in zip(ids, vecs, strict=False)
     }
+
+def _sidecar_dim(embeddings_path):
+    """Return the sidecar's ``meta["dim"]``, or None when no sidecar."""
+    if embeddings_path is None:
+        return None
+    sidecar = load_sidecar(embeddings_path)
+    if sidecar is None:
+        return None
+    return int(json.loads(str(sidecar["text_meta"]))["dim"])
+
+
+def _vector_index_ddl(space: str, dim: int) -> str:
+    """Idempotent vector-index DDL for one embedding space, dimensioned by ``dim``."""
+    return (
+        f"CREATE VECTOR INDEX graphify_{space}_embeddings IF NOT EXISTS "
+        f"FOR (n:Embedded) ON (n.embedding_{space}) "
+        f"OPTIONS {{indexConfig: {{`vector.dimensions`: {dim}, "
+        "`vector.similarity_function`: 'cosine'}}"
+    )
+
+
+def _emit_vector_indexes(run, dim: int) -> None:
+    """Emit one vector index per space; a driver that cannot build the index
+    must not fail the push."""
+    for space in ("text", "code"):
+        try:
+            result = run(_vector_index_ddl(space, dim))
+            if result is not None and hasattr(result, "consume"):
+                result.consume()
+        except Exception:
+            pass
+
 
 def _embedding_prop(embedding_index, node_id, file_type, props):
     """Splice the sidecar's vector for ``node_id`` (when present) into ``props``
@@ -97,6 +131,7 @@ def push_to_neo4j(
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
     embedding_index = _embedding_index(embeddings_path)
+    dim = _sidecar_dim(embeddings_path)
     nodes_pushed = 0
     edges_pushed = 0
 
@@ -105,16 +140,21 @@ def push_to_neo4j(
             props = _pushable_props(data)
             props["id"] = node_id
             _embedding_prop(embedding_index, node_id, data.get("file_type"), props)
+            embedded = "embedding_text" in props or "embedding_code" in props
             cid = node_community.get(node_id)
             if cid is not None:
                 props["community"] = cid
             ftype = _safe_label(data.get("file_type", "Entity").capitalize())
             session.run(
-                f"MERGE (n:{ftype} {{id: $id}}) SET n += $props",
+                f"MERGE (n:{ftype} {{id: $id}})"
+                f"{' SET n:Embedded' if embedded else ''} SET n += $props",
                 id=node_id,
                 props=props,
             )
             nodes_pushed += 1
+
+        if dim is not None:
+            _emit_vector_indexes(session.run, dim)
 
         for u, v, data in G.edges(data=True):
             rel = _safe_rel(data.get("relation", "RELATED_TO"))
@@ -194,6 +234,7 @@ def push_to_falkordb(
     )
     graph = db.select_graph(graph_name)
     embedding_index = _embedding_index(embeddings_path)
+    dim = _sidecar_dim(embeddings_path)
     nodes_pushed = 0
     edges_pushed = 0
 
@@ -201,15 +242,20 @@ def push_to_falkordb(
         props = _pushable_props(data)
         props["id"] = node_id
         _embedding_prop(embedding_index, node_id, data.get("file_type"), props)
+        embedded = "embedding_text" in props or "embedding_code" in props
         cid = node_community.get(node_id)
         if cid is not None:
             props["community"] = cid
         ftype = _safe_label(data.get("file_type", "Entity").capitalize())
         graph.query(
-            f"MERGE (n:{ftype} {{id: $id}}) SET n += $props",
+            f"MERGE (n:{ftype} {{id: $id}})"
+            f"{' SET n:Embedded' if embedded else ''} SET n += $props",
             {"id": node_id, "props": props},
         )
         nodes_pushed += 1
+
+    if dim is not None:
+        _emit_vector_indexes(graph.query, dim)
 
     for u, v, data in G.edges(data=True):
         rel = _safe_rel(data.get("relation", "RELATED_TO"))
