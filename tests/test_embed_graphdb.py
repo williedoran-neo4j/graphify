@@ -19,6 +19,7 @@ import types
 
 import networkx as nx
 
+from graphify.embed import _EMBED_SPACE_BY_FILE_TYPE, _embed_space
 from graphify.exporters.graphdb import (
     _pushable_props,
     push_to_falkordb,
@@ -190,3 +191,32 @@ def test_all_four_push_sites_filter_through_shared_pushable_props(monkeypatch):
     ]
     assert falkordb_nodes["n1"] == expected_node
     assert falkordb_edges == [expected_edge]
+
+
+def test_vector_space_of_file_types_document_absent():
+    """A node's embedding space is derived from its file_type: code-family
+    types land in the "code" space, document-family types in the "text" space,
+    and an absent/None file_type maps to NO space — so the sidecar, the
+    per-space embedding props, and the `:Embedded` label can all be derived
+    from this same one-token decision.
+    """
+    assert _embed_space("code") == "code"
+    assert _embed_space("document") == "text"
+    assert _embed_space("paper") == "text"
+    assert _embed_space("rationale") == "text"
+    assert _embed_space("concept") == "text"
+
+    # Non-text-family and absent/None file types never get a vector space.
+    assert _embed_space("image") is None
+    assert _embed_space(None) is None
+    assert _embed_space("") is None
+
+    # The per-family table drives the decision: each family member resolves
+    # through it, and an absent key (image / None) resolves to no space.
+    assert _EMBED_SPACE_BY_FILE_TYPE["code"] == "code"
+    assert _EMBED_SPACE_BY_FILE_TYPE["document"] == "text"
+    assert _EMBED_SPACE_BY_FILE_TYPE["paper"] == "text"
+    assert _EMBED_SPACE_BY_FILE_TYPE["rationale"] == "text"
+    assert _EMBED_SPACE_BY_FILE_TYPE["concept"] == "text"
+    assert _EMBED_SPACE_BY_FILE_TYPE.get("image") is None
+    assert _EMBED_SPACE_BY_FILE_TYPE.get(None) is None

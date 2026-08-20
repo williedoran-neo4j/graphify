@@ -26,6 +26,21 @@ from graphify.llm import (
 
 _TEXT_FILE_TYPES = frozenset({"document", "paper", "rationale", "concept", "code"})
 
+# file_type → embedding space: the table the code/text vector index DDL and
+# the per-space node props / `:Embedded` label branch on.
+_EMBED_SPACE_BY_FILE_TYPE: dict = {
+    "code": "code",
+    "document": "text",
+    "paper": "text",
+    "rationale": "text",
+    "concept": "text",
+}
+
+
+def _embed_space(file_type: str | None) -> str | None:
+    """Return the embedding space ("code"/"text") for a file_type, or None."""
+    return _EMBED_SPACE_BY_FILE_TYPE.get(file_type)
+
 
 def _neighbour_text(graph, nid: str, limit: int = 10) -> str:
     """Return the space-joined neighbour labels of ``nid``, highest-degree first.
