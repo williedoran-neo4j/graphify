@@ -10,6 +10,7 @@ from networkx.readwrite import json_graph as _jg
 _GLOBAL_DIR = Path.home() / ".graphify"
 _GLOBAL_GRAPH = _GLOBAL_DIR / "global-graph.json"
 _GLOBAL_MANIFEST = _GLOBAL_DIR / "global-manifest.json"
+_GLOBAL_EMBEDDINGS = _GLOBAL_DIR / "embeddings-global.npz"
 
 
 def _load_manifest() -> dict:
@@ -182,3 +183,26 @@ def global_list() -> dict:
 
 def global_path() -> Path:
     return _GLOBAL_GRAPH
+
+
+def global_reembed() -> dict:
+    """Re-embed the post-add global graph's text nodes into the global sidecar.
+
+    Runs ``enrich_embeddings`` against the already-namespaced global graph so
+    every sidecar ``text_ids`` row carries ``repo_tag::local_id`` (C12/I14).
+    Returns {"written": bool, "sidecar": str, "nodes": int}.
+    """
+    from graphify.embed import enrich_embeddings
+
+    G = _load_global_graph()
+    # The sidecar destination is derived at call time (not the module constant)
+    # so tests that patch the _GLOBAL_* module singletons are tracked.
+    sidecar = Path(_GLOBAL_GRAPH).parent / "embeddings-global.npz"
+    if G.number_of_nodes() == 0:
+        return {"written": False, "sidecar": str(sidecar), "nodes": 0}
+    # Passing the GLOBAL graph path roots the cache at _GLOBAL_DIR and makes
+    # enrich_embeddings write its sibling .npz there; move it to the
+    # embeddings-global.npz name (never a per-repo graphify-out/embeddings.npz).
+    written = enrich_embeddings(G, str(_GLOBAL_GRAPH))
+    Path(written).replace(sidecar)
+    return {"written": True, "sidecar": str(sidecar), "nodes": G.number_of_nodes()}

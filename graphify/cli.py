@@ -2761,8 +2761,18 @@ def dispatch_command(cmd: str) -> None:
             global_remove as _global_remove,
             global_list as _global_list,
             global_path as _global_path,
+            global_reembed as _global_reembed,
         )
-        if subcmd == "add":
+        if subcmd == "re-embed":
+            try:
+                result = _global_reembed()
+            except Exception as exc:
+                print(f"error: {exc}", file=sys.stderr); sys.exit(1)
+            if result["written"]:
+                print(f"Global embeddings re-embedded: {result['sidecar']} ({result['nodes']} nodes).")
+            else:
+                print("Global graph is empty — nothing to embed.")
+        elif subcmd == "add":
             # graphify global add <graph.json> [--as <tag>]
             args = sys.argv[3:]
             source = None
