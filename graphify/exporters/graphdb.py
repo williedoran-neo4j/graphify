@@ -63,10 +63,7 @@ def push_to_neo4j(
 
     with driver.session() as session:
         for node_id, data in G.nodes(data=True):
-            props = {
-                k: v for k, v in data.items()
-                if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-            }
+            props = _pushable_props(data)
             props["id"] = node_id
             cid = node_community.get(node_id)
             if cid is not None:
@@ -81,10 +78,7 @@ def push_to_neo4j(
 
         for u, v, data in G.edges(data=True):
             rel = _safe_rel(data.get("relation", "RELATED_TO"))
-            props = {
-                k: v for k, v in data.items()
-                if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-            }
+            props = _pushable_props(data)
             session.run(
                 f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
                 f"MERGE (a)-[r:{rel}]->(b) SET r += $props",
@@ -162,10 +156,7 @@ def push_to_falkordb(
     edges_pushed = 0
 
     for node_id, data in G.nodes(data=True):
-        props = {
-            k: v for k, v in data.items()
-            if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-        }
+        props = _pushable_props(data)
         props["id"] = node_id
         cid = node_community.get(node_id)
         if cid is not None:
@@ -179,10 +170,7 @@ def push_to_falkordb(
 
     for u, v, data in G.edges(data=True):
         rel = _safe_rel(data.get("relation", "RELATED_TO"))
-        props = {
-            k: v for k, v in data.items()
-            if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
-        }
+        props = _pushable_props(data)
         graph.query(
             f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
             f"MERGE (a)-[r:{rel}]->(b) SET r += $props",

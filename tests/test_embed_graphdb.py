@@ -13,7 +13,17 @@ list. This file is the R7 test home; the other slices live in
 """
 from __future__ import annotations
 
-from graphify.exporters.graphdb import _pushable_props
+import inspect
+import sys
+import types
+
+import networkx as nx
+
+from graphify.exporters.graphdb import (
+    _pushable_props,
+    push_to_falkordb,
+    push_to_neo4j,
+)
 
 
 def test_pushable_props_float_list_survives_but_bool_first_and_dict_list_dropped():
@@ -37,7 +47,7 @@ def test_pushable_props_float_list_survives_but_bool_first_and_dict_list_dropped
     assert props["counts"] == [1, 2, 3]
     assert props["mixed_num"] == [1, 2.5, 3]
 
-    # A bool member is not a number (I9): dropped, never coerced to 1. A
+    # A bool member is not a number: dropped, never coerced to 1. A
     # list[dict] is nested/object data the driver cannot store: dropped.
     assert "flags" not in props
     assert "records" not in props
@@ -48,3 +58,135 @@ def test_pushable_props_float_list_survives_but_bool_first_and_dict_list_dropped
     assert props["score"] == 0.5
     assert props["active"] is True
     assert "_internal" not in props
+
+
+class _RecordingNeo4jSession:
+    """Recording stand-in for the neo4j driver's session (context manager)."""
+
+    def __init__(self, log: list):
+        self._log = log
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def run(self, query, **params):
+        self._log.append(("neo4j", query, params))
+
+
+class _RecordingNeo4jDriver:
+    def __init__(self, log: list):
+        self._log = log
+
+    def session(self):
+        return _RecordingNeo4jSession(self._log)
+
+    def close(self):
+        pass
+
+
+class _RecordingFalkorQuery:
+    def __init__(self, log: list):
+        self._log = log
+
+    def query(self, cypher, params):
+        self._log.append(("falkordb", cypher, params))
+
+
+def _install_fake_neo4j(monkeypatch, log: list) -> None:
+    """Point sys.modules['neo4j'] at a recording driver so push_to_neo4j runs
+    without a live server."""
+    fake = types.ModuleType("neo4j")
+
+    class _GraphDatabase:
+        @staticmethod
+        def driver(uri, auth=None):
+            return _RecordingNeo4jDriver(log)
+
+    fake.GraphDatabase = _GraphDatabase
+    monkeypatch.setitem(sys.modules, "neo4j", fake)
+
+
+def _install_fake_falkordb(monkeypatch, log: list) -> None:
+    """Point sys.modules['falkordb'] at a recording client so push_to_falkordb
+    runs without a live server."""
+    fake = types.ModuleType("falkordb")
+
+    class _FalkorDB:
+        def __init__(self, *args, **kwargs):
+            self._log = log
+
+        def select_graph(self, name):
+            return _RecordingFalkorQuery(self._log)
+
+    fake.FalkorDB = _FalkorDB
+    monkeypatch.setitem(sys.modules, "falkordb", fake)
+
+
+def test_all_four_push_sites_filter_through_shared_pushable_props(monkeypatch):
+    """Both push functions must forward their node AND edge property filtering
+    through the shared module-level ``_pushable_props`` helper instead of each
+    re-deriving the predicate inline, and the edge merge must receive exactly
+    the helper's output — never an ``id``/``community`` key spliced in next to
+    the edge's own attributes.
+
+    Real edge data is scalar-only, so the fold is invisible to real graphs.
+    The fixture below therefore hangs an all-numeric list off both a node and
+    an edge — the one value shape the old inline comprehension dropped and the
+    shared helper keeps — so the recorded driver payloads can tell the two
+    filters apart.
+    """
+    G = nx.Graph()
+    G.add_node("n1", label="doc", file_type="document", evals=[0.5, 1.25])
+    G.add_node("n2", label="target")
+    G.add_edge("n1", "n2", relation="imports", weights=[2, 3])
+
+    # Structural lock: each push function calls the helper once for its node
+    # path and once for its edge path, and no inline comprehension survives.
+    for fn in (push_to_neo4j, push_to_falkordb):
+        src = inspect.getsource(fn)
+        assert src.count("_pushable_props(") == 2, (
+            f"{fn.__name__} must filter node and edge props via _pushable_props"
+        )
+        assert "k: v for k, v in data.items()" not in src
+
+    expected_node = dict(_pushable_props(dict(G.nodes["n1"])))
+    expected_node["id"] = "n1"
+    expected_edge = _pushable_props(dict(G.edges["n1", "n2"]))
+    assert "id" not in expected_edge  # edge props are the filter output alone
+
+    neo4j_log = []
+    _install_fake_neo4j(monkeypatch, neo4j_log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+
+    neo4j_nodes = {
+        params["id"]: params["props"]
+        for kind, query, params in neo4j_log
+        if kind == "neo4j" and "SET n +=" in query
+    }
+    neo4j_edges = [
+        params["props"]
+        for kind, query, params in neo4j_log
+        if kind == "neo4j" and "SET r +=" in query
+    ]
+    assert neo4j_nodes["n1"] == expected_node
+    assert neo4j_edges == [expected_edge]
+
+    falkordb_log = []
+    _install_fake_falkordb(monkeypatch, falkordb_log)
+    push_to_falkordb(G, uri="redis://localhost:6379")
+
+    falkordb_nodes = {
+        params["id"]: params["props"]
+        for kind, query, params in falkordb_log
+        if kind == "falkordb" and "SET n +=" in query
+    }
+    falkordb_edges = [
+        params["props"]
+        for kind, query, params in falkordb_log
+        if kind == "falkordb" and "SET r +=" in query
+    ]
+    assert falkordb_nodes["n1"] == expected_node
+    assert falkordb_edges == [expected_edge]
