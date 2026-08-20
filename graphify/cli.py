@@ -2716,7 +2716,8 @@ def dispatch_command(cmd: str) -> None:
                     print("error: --password required for --push", file=sys.stderr)
                     sys.exit(1)
                 result = _push(G, uri=push_uri, user=push_user,
-                               password=push_password, communities=communities)
+                               password=push_password, communities=communities,
+                               embeddings_path=out_dir / "embeddings.npz")
                 print(f"Pushed to Neo4j: {result['nodes']} nodes, {result['edges']} edges")
             else:
                 from graphify.export import to_cypher as _to_cypher
@@ -2727,7 +2728,8 @@ def dispatch_command(cmd: str) -> None:
             if push_uri:
                 from graphify.export import push_to_falkordb as _push
                 result = _push(G, uri=push_uri, user=push_user,
-                               password=push_password, communities=communities)
+                               password=push_password, communities=communities,
+                               embeddings_path=out_dir / "embeddings.npz")
                 print(f"Pushed to FalkorDB: {result['nodes']} nodes, {result['edges']} edges")
             else:
                 from graphify.export import to_cypher as _to_cypher
