@@ -1,10 +1,18 @@
-"""R6/C6.1 — global re-embed: the post-`global_add` (namespaced) graph is what
-gets embedded, the sidecar lands as `~/.graphify/embeddings-global.npz` (a
-sibling of `global-graph.json`, NOT a per-repo `graphify-out/embeddings.npz`),
-and every `text_ids` row carries `repo_tag::local_id` — never a bare local id
-(C12 bullets 1/2/3, I14)."""
+"""R6 — global re-embed on the post-`global_add` (namespaced) graph.
+
+C6.1 — the sidecar lands as `~/.graphify/embeddings-global.npz` (a sibling of
+`global-graph.json`, NOT a per-repo `graphify-out/embeddings.npz`), and every
+`text_ids` row carries `repo_tag::local_id` — never a bare local id
+(C12 bullets 1/2/3, I14).
+
+C6.2 — the cross-repo cache dedup lock (cache-dedup-across-repos fixture, C12
+fourth bullet): two repos' identical external-library node texts hash to ONE
+cached vector, so a re-embed after both `global_add`s issues ZERO additional
+`_call_embeddings` calls for repoB's contribution.
+"""
 from __future__ import annotations
 
+import hashlib
 import json
 
 import numpy as np
@@ -115,3 +123,129 @@ def _embed_enriched_global_graph() -> "nx.Graph":
     from graphify.global_graph import _load_global_graph
 
     return _load_global_graph()
+
+
+def test_cache_dedup_across_repos_shared_external_library_node(
+    tmp_path, monkeypatch
+):
+    """C6.2 — cross-repo cache dedup (cache-dedup-across-repos fixture, C12
+    fourth bullet, I14).
+
+    The plan's shared external-library node is in the fixture exactly as
+    constructed: repoB's external code node carries an IDENTICAL constructed
+    text to repoA's -- the cache key is ``sha256(text)``, so the cache
+    legitimately holds ONE entry after repoA's add. ``global_add`` then dedups
+    repoB's external node OUT of the merged graph (its id is remapped to
+    ``repoA::requests``), so a re-embed over the post-``global_add`` graph
+    re-runs the SAME text and serves it from the warm cache with ZERO seam
+    calls (``recorded`` stays empty).
+
+    Sequence pinned through the real ``enrich_embeddings`` + real
+    ``sha256(text)`` cache + real seam spy (``_broadcast_spy_embeddings``):
+
+    1. Both ``global_add``s MUST run before the first re-embed (C6.1's
+       red/satisfiability note: the R4-skip guard destroys add-ordering if the
+       source is unchanged). ``global_reembed()`` then issues exactly ONE seam
+       call carrying the shared external text.
+    2. The cache entry for that text exists at the exactly derived path
+       ``{global-dir}/graphify-out/cache/embed-ollama-nomic-embed-text/
+       sha256("HTTP requests\\n\\n\\n").npy`` -- the repo-agnostic key.
+    3. A SECOND ``global_reembed()`` over the unchanged graph issues ZERO calls
+       (R4 RT10). THIS is the dedup observation the plan names: repoB's
+       contribution adds no NEW embedding -- its id was canonicalized to
+       ``repoA::requests`` by ``global_add`` and its text's vector is served
+       from the shared cache entry.
+    4. The final written sidecar pins ``text_ids`` == ``["repoA::acceptance",
+       "repoA::requests", "repoB::api"]`` with no second copy of the external
+       node -- every id is ``repo_tag::local_id`` (I14), and the dedup
+       canonical id is repoA's, never a duplicated repoB-flagged row.
+    """
+    from graphify.global_graph import global_add, global_reembed
+    from graphify.embed import _embed_texts_key
+    from graphify import cache as _cache
+
+    # Per repo: a distinct text-family document node (with a ``source_file``)
+    # plus an external-library code node whose ID is DIFFERENT across the two
+    # repos ("requests" vs "http") but whose constructed text is IDENTICAL
+    # (secure label, empty path, empty rationale/neighbour lines). The external
+    # node carries NO ``source_file`` -- absent it, ``global_add``'s
+    # label-based dedup key matches across repos (C6.2's fixture constraint).
+    for repo, doc_id, src_file, doc_label, ext_id in (
+        ("repoA", "acceptance", "docs/acceptance.md", "Acceptance flow", "requests"),
+        ("repoB", "api", "docs/api.md", "API flow", "http"),
+    ):
+        G = nx.Graph()
+        G.add_node(
+            doc_id,
+            label=doc_label,
+            source_file=src_file,
+            file_type="document",
+        )
+        G.add_node(
+            ext_id,
+            label="HTTP requests",
+            file_type="code",
+        )
+        src = tmp_path / f"{repo}-graph.json"
+        src.write_text(
+            json.dumps(nx.node_link_data(G, edges="links")), encoding="utf-8"
+        )
+
+    global_dir = tmp_path / "global"
+
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"), \
+         patch("graphify.global_graph._GLOBAL_EMBEDDINGS", global_dir / "embeddings-global.npz"):
+        import graphify.embed as _embed
+        recorded: list = []
+        _broadcast_spy_embeddings(monkeypatch, recorded)
+
+        # BOTH adds first, so the re-embed sees the full post-add state at once
+        # (C6.1's red/satisfiability note).
+        global_add(tmp_path / "repoA-graph.json", "repoA")
+        global_add(tmp_path / "repoB-graph.json", "repoB")
+
+        result1 = global_reembed()
+        assert result1["written"] is True
+        assert result1["nodes"] == 3  # acceptance + requests + api
+        assert len(recorded) == 1, recorded
+        # Cold run over the 3 post-add text-family nodes (code nodes ARE
+        # text-family): one batch carrying all THREE constructed texts in
+        # sorted-id order — the shared external text included once, under the
+        # canonical ``repoA::requests`` id (repoB's bare ``http`` was deduped
+        # out by ``global_add``, so it contributes no row).
+        assert recorded[0][1]["inputs"] == [
+            "Acceptance flow\ndocs/acceptance.md\n\n",
+            "HTTP requests\n\n\n",
+            "API flow\ndocs/api.md\n\n",
+        ]
+
+        # The repo-agnostic cache key: entry exists at the sha256(constructed
+        # text) path under the global graph's root. A source-file-hash key (or
+        # a repo-tagged key) would place the vector somewhere else and the
+        # repoB warm re-run below would MISS it — recording a second call.
+        cache_entry = (
+            _cache.cache_dir(global_dir, kind=_embed_texts_key("ollama", "nomic-embed-text"))
+            / f"{hashlib.sha256('HTTP requests\n\n\n'.encode()).hexdigest()}.npy"
+        )
+        assert cache_entry.is_file()
+
+        # WARM re-run over the unchanged post-add global graph: repoB's
+        # external node was dedup-canonicalized to repoA::requests (its text
+        # is the SAME string), so the vector is served from the shared cache
+        # entry — ZERO additional seam calls. This is the dedup observation.
+        recorded.clear()
+        result2 = global_reembed()
+        assert result2["written"] is True
+        assert result2["nodes"] == 3
+        assert len(recorded) == 0, recorded
+
+    sidecar = global_dir / "embeddings-global.npz"
+    assert sidecar.is_file()
+    with np.load(sidecar) as data:
+        assert list(data["text_ids"]) == [
+            "repoA::acceptance",
+            "repoA::requests",
+            "repoB::api",
+        ]
