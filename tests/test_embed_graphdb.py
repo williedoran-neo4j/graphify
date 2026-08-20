@@ -295,3 +295,66 @@ def test_neo4j_embedding_props_L2_EQ_sidecar(monkeypatch, tmp_path):
         assert not [k for k in props if k.startswith("embedding_")], (
             f"node {pid} must carry no embedding prop without a sidecar"
         )
+
+
+def test_falkordb_embedding_props_L2_EQ_sidecar(monkeypatch, tmp_path):
+    """The FalkorDB push must splice sidecar vectors exactly like the Neo4j
+    push: a node whose id is in the sidecar gets its row under
+    ``embedding_<space>`` (text for document-family, code for code), and a
+    node whose id is absent -- or which has no file_type at all -- gets no
+    embedding prop. The pushed values must equal the sidecar's own row, so a
+    delete of the FalkorDB splice site (graphdb.py's call to
+    ``_embedding_prop``) would fail this test."""
+    import numpy as np
+
+    G = nx.Graph()
+    G.add_node("doc1", label="report", file_type="document")
+    G.add_node("code1", label="module.py", file_type="code")
+    G.add_node("no_vec", label="dashboard", file_type="concept")
+    G.add_node("no_type", label="untyped")
+    G.add_edge("doc1", "code1", relation="references")
+
+    sidecar = tmp_path / "embeddings.npz"
+    np.savez(
+        sidecar,
+        text_ids=np.array(["doc1", "code1"]),
+        text_vecs=np.array(
+            [[0.5, -0.5, 1.0, 0.0], [0.0, 1.0, 0.5, -1.0]], dtype=np.float32
+        ),
+        text_meta=np.str_('{"dim": 4}'),
+    )
+
+    log = []
+    _install_fake_falkordb(monkeypatch, log)
+    push_to_falkordb(
+        G, uri="redis://localhost:6379", embeddings_path=sidecar
+    )
+
+    pushed = {
+        params["id"]: params["props"]
+        for kind, query, params in log
+        if kind == "falkordb" and "SET n +=" in query
+    }
+    doc_row = np.array([0.5, -0.5, 1.0, 0.0], dtype=np.float32)
+    code_row = np.array([0.0, 1.0, 0.5, -1.0], dtype=np.float32)
+    assert np.allclose(pushed["doc1"]["embedding_text"], doc_row)
+    assert np.allclose(pushed["code1"]["embedding_code"], code_row)
+    assert pushed["doc1"]["embedding_text"] == doc_row.tolist()
+    assert pushed["code1"]["embedding_code"] == code_row.tolist()
+    assert "embedding_text" not in pushed["no_vec"]
+    assert "embedding_code" not in pushed["no_vec"]
+    assert "embedding_text" not in pushed["no_type"]
+    assert "embedding_code" not in pushed["no_type"]
+
+    no_sidecar_log = []
+    _install_fake_falkordb(monkeypatch, no_sidecar_log)
+    push_to_falkordb(G, uri="redis://localhost:6379")
+    no_sidecar_props = {
+        params["id"]: params["props"]
+        for kind, query, params in no_sidecar_log
+        if kind == "falkordb" and "SET n +=" in query
+    }
+    for pid, props in no_sidecar_props.items():
+        assert not [k for k in props if k.startswith("embedding_")], (
+            f"node {pid} must carry no embedding prop without a sidecar"
+        )
