@@ -220,3 +220,78 @@ def test_vector_space_of_file_types_document_absent():
     assert _EMBED_SPACE_BY_FILE_TYPE["concept"] == "text"
     assert _EMBED_SPACE_BY_FILE_TYPE.get("image") is None
     assert _EMBED_SPACE_BY_FILE_TYPE.get(None) is None
+
+
+def test_neo4j_embedding_props_L2_EQ_sidecar(monkeypatch, tmp_path):
+    """Pushing a graph with an ``embeddings_path`` sidecar must land the
+    sidecar's vector rows on the merged node props, split into per-space
+    ``embedding_text``/``embedding_code`` keys by the node's file_type.
+
+    The pushed array must equal the sidecar's own row for the same id
+    (both come from one ``enrich_embeddings`` writer, so they cannot drift).
+    Only nodes whose id is actually in the sidecar get an embedding prop, and
+    a node with no file_type gets none even when its id is present.
+    """
+    import numpy as np
+
+    G = nx.Graph()
+    G.add_node("doc1", label="report", file_type="document")
+    G.add_node("code1", label="module.py", file_type="code")
+    G.add_node("no_vec", label="dashboard", file_type="concept")
+    G.add_node("no_type", label="untyped")
+    G.add_edge("doc1", "code1", relation="references")
+
+    sidecar = tmp_path / "embeddings.npz"
+    np.savez(
+        sidecar,
+        text_ids=np.array(["doc1", "code1"]),
+        text_vecs=np.array(
+            [[0.5, -0.5, 1.0, 0.0], [0.0, 1.0, 0.5, -1.0]], dtype=np.float32
+        ),
+        text_meta=np.str_('{"dim": 4}'),
+    )
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(
+        G,
+        uri="bolt://localhost:7687",
+        user="neo4j",
+        password="pw",
+        embeddings_path=sidecar,
+    )
+
+    pushed = {
+        params["id"]: params["props"]
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    }
+    doc_row = np.array([0.5, -0.5, 1.0, 0.0], dtype=np.float32)
+    code_row = np.array([0.0, 1.0, 0.5, -1.0], dtype=np.float32)
+    # The driver payload is a plain list of floats, so it round-trips through
+    # the shared prop filter instead of being dropped as a numpy array.
+    assert np.allclose(pushed["doc1"]["embedding_text"], doc_row)
+    assert np.allclose(pushed["code1"]["embedding_code"], code_row)
+    assert pushed["doc1"]["embedding_text"] == doc_row.tolist()
+    assert pushed["code1"]["embedding_code"] == code_row.tolist()
+    assert "embedding_text" not in pushed["no_vec"]
+    assert "embedding_code" not in pushed["no_vec"]
+    assert "embedding_text" not in pushed["no_type"]
+    assert "embedding_code" not in pushed["no_type"]
+
+    # I1: without a sidecar the push keeps today's exact behavior — no
+    # embedding_* prop anywhere, code or text.
+    no_sidecar_log = []
+    _install_fake_neo4j(monkeypatch, no_sidecar_log)
+    push_to_neo4j(
+        G, uri="bolt://localhost:7687", user="neo4j", password="pw"
+    )
+    no_sidecar_props = {
+        params["id"]: params["props"]
+        for kind, query, params in no_sidecar_log
+        if kind == "neo4j" and "SET n +=" in query
+    }
+    for pid, props in no_sidecar_props.items():
+        assert not [k for k in props if k.startswith("embedding_")], (
+            f"node {pid} must carry no embedding prop without a sidecar"
+        )

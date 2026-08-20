@@ -2,8 +2,45 @@
 from __future__ import annotations
 
 from graphify.analyze import _node_community_map
+from graphify.embed import _embed_space
+from graphify.search import load_sidecar
 import networkx as nx
+import os
 import re
+
+
+def _embedding_index(embeddings_path):
+    """Map sidecar id -> {space: list of floats}, or None when no sidecar
+    was given or the given path holds no stored vectors."""
+    if embeddings_path is None:
+        return None
+    sidecar = load_sidecar(embeddings_path)
+    if sidecar is None:
+        return None
+    import numpy as np
+
+    ids = sidecar["text_ids"]
+    vecs = np.asarray(sidecar["text_vecs"])
+    if len(ids) == 0:
+        return None
+    return {
+        str(nid): {"text": row.tolist(), "code": row.tolist()}
+        for nid, row in zip(ids, vecs, strict=False)
+    }
+
+def _embedding_prop(embedding_index, node_id, file_type, props):
+    """Splice the sidecar's vector for ``node_id`` (when present) into ``props``
+    under ``embedding_<space>``, keyed by the node's file_type's space."""
+    if embedding_index is None:
+        return props
+    space = _embed_space(file_type)
+    if space is None:
+        return props
+    row = embedding_index.get(node_id)
+    if row is None:
+        return props
+    props[f"embedding_{space}"] = row[space]
+    return props
 
 
 def _pushable_props(data: dict) -> dict:
@@ -32,6 +69,7 @@ def push_to_neo4j(
     user: str,
     password: str,
     communities: dict[int, list[str]] | None = None,
+    embeddings_path: str | os.PathLike | None = None,
 ) -> dict[str, int]:
     """Push graph directly to a running Neo4j instance via the Python driver.
 
@@ -58,6 +96,7 @@ def push_to_neo4j(
         return sanitized if sanitized else "Entity"
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
+    embedding_index = _embedding_index(embeddings_path)
     nodes_pushed = 0
     edges_pushed = 0
 
@@ -65,6 +104,7 @@ def push_to_neo4j(
         for node_id, data in G.nodes(data=True):
             props = _pushable_props(data)
             props["id"] = node_id
+            _embedding_prop(embedding_index, node_id, data.get("file_type"), props)
             cid = node_community.get(node_id)
             if cid is not None:
                 props["community"] = cid
@@ -98,6 +138,7 @@ def push_to_falkordb(
     password: str | None = None,
     communities: dict[int, list[str]] | None = None,
     graph_name: str = "graphify",
+    embeddings_path: str | os.PathLike | None = None,
 ) -> dict[str, int]:
     """Push graph directly to a running FalkorDB instance via the Python SDK.
 
@@ -152,12 +193,14 @@ def push_to_falkordb(
         password=connect_password,
     )
     graph = db.select_graph(graph_name)
+    embedding_index = _embedding_index(embeddings_path)
     nodes_pushed = 0
     edges_pushed = 0
 
     for node_id, data in G.nodes(data=True):
         props = _pushable_props(data)
         props["id"] = node_id
+        _embedding_prop(embedding_index, node_id, data.get("file_type"), props)
         cid = node_community.get(node_id)
         if cid is not None:
             props["community"] = cid
