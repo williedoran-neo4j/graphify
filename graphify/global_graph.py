@@ -10,7 +10,6 @@ from networkx.readwrite import json_graph as _jg
 _GLOBAL_DIR = Path.home() / ".graphify"
 _GLOBAL_GRAPH = _GLOBAL_DIR / "global-graph.json"
 _GLOBAL_MANIFEST = _GLOBAL_DIR / "global-manifest.json"
-_GLOBAL_EMBEDDINGS = _GLOBAL_DIR / "embeddings-global.npz"
 
 
 def _load_manifest() -> dict:

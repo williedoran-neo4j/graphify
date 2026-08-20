@@ -63,8 +63,7 @@ def test_global_reembed_writes_namespaced_sidecar_to_global_dir(
 
     with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
          patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
-         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"), \
-         patch("graphify.global_graph._GLOBAL_EMBEDDINGS", global_dir / "embeddings-global.npz"):
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
         import graphify.embed as _embed
         # Real `enrich_embeddings` from the START — the seam's cache is live so
         # the re-run and hence repoB's add are all measured cache behavior.
@@ -195,8 +194,7 @@ def test_cache_dedup_across_repos_shared_external_library_node(
 
     with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
          patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
-         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"), \
-         patch("graphify.global_graph._GLOBAL_EMBEDDINGS", global_dir / "embeddings-global.npz"):
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
         import graphify.embed as _embed
         recorded: list = []
         _broadcast_spy_embeddings(monkeypatch, recorded)
@@ -318,8 +316,7 @@ def test_global_sidecar_no_bare_local_ids(tmp_path, monkeypatch):
 
     with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
          patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
-         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"), \
-         patch("graphify.global_graph._GLOBAL_EMBEDDINGS", global_dir / "embeddings-global.npz"):
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
         _broadcast_spy_embeddings(monkeypatch, recorded)
 
         for repo in ("repoA", "repoB"):
