@@ -6,6 +6,26 @@ import networkx as nx
 import re
 
 
+def _pushable_props(data: dict) -> dict:
+    """Return the properties from ``data`` that can be pushed to a graph DB.
+
+    Keeps scalar values (str/int/float/bool) and lists whose every member is a
+    number (int/float, never bool). A list with a bool member or any nested/
+    object member (e.g. dict) is dropped whole.
+    """
+    props = {}
+    for k, v in data.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            props[k] = v
+        elif isinstance(v, list) and all(
+            isinstance(m, (int, float)) and not isinstance(m, bool) for m in v
+        ):
+            props[k] = v
+    return props
+
+
 def push_to_neo4j(
     G: nx.Graph,
     uri: str,
