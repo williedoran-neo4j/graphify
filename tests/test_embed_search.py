@@ -35,6 +35,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -939,4 +941,77 @@ def test_search_vectors_merges_code_and_text_spaces(tmp_path):
     assert "CB Code" in result_text, (
         f"the surviving code row (c-b-02, score 1.1) must render its graph "
         f"label; got {result_text!r}"
+    )
+
+
+def test_search_vectors_embeds_dual_spaces_concurrently(tmp_path):
+    """A dual-space search embeds the query in the code space and the text
+    space CONCURRENTLY, not one-after-the-other. The two spaces carry distinct
+    models (text -> nomic-embed-text, code -> qwen2.5-coder in this fixture),
+    so both embeds are genuinely required and cannot be served from a single
+    cached entry.
+
+    An injected query_embed seam sleeps briefly and records each call's
+    [start, end) interval under a lock. The assertion is interleaving-based,
+    never wall-clock-based: if both embeds overlap in time, each call's start
+    is strictly earlier than the other call's end (max(start) < min(end)), and
+    the "seen-while-active" flag is set; under the C5 serial loop the second
+    embed only starts after the first returns, so the intervals touch at most
+    and the flag stays clear. The flag + the total elapsed time (well under
+    the two-sleep sum that a serial run needs, but allowing generous slack)
+    both discriminate; either arm alone proves the point, and neither can
+    flake on scheduler jitter because the assertions reason about recorded
+    overlap, not exact sleeps.
+    """
+    sidecar = _write_dual_sidecar(tmp_path)
+    gate = 0.2
+    lock = threading.Lock()
+    seen_while_active = False
+    intervals: dict[str, list[float]] = {}
+
+    def slow_embed(query, *, space, meta):
+        """Sleep `gate` seconds, recording this call's [start, end) window and
+        whether any other space's embed was already in-flight at start time.
+        The in-flight marker (end == None) is written BEFORE the sleep so two
+        fully-overlapping embeds observe each other."""
+        nonlocal seen_while_active
+        del query, meta
+        started = time.monotonic()
+        with lock:
+            intervals[space] = (started, None)
+            for other, (os, oe) in intervals.items():
+                if other != space and os <= started and (oe is None or started < oe):
+                    seen_while_active = True
+        time.sleep(gate)
+        ended = time.monotonic()
+        with lock:
+            intervals[space] = (started, ended)
+        return [1.0, 2.0, 0.5, 0, 0, 0, 0, 0]
+
+    start = time.monotonic()
+    search_vectors(
+        sidecar,
+        "dual query",
+        space="text",
+        query_embed=slow_embed,
+    )
+    elapsed = time.monotonic() - start
+
+    assert set(intervals) == {"text", "code"}, (
+        "both the text AND code spaces must embed the query; the code group is "
+        f"not being embedded — got {sorted(intervals)!r}"
+    )
+    text_start, text_end = intervals["text"]
+    code_start, code_end = intervals["code"]
+    assert max(text_start, code_start) < min(text_end, code_end), (
+        "the text and code embeds must OVERLAP in time; a serial one-then-the-"
+        "other loop computes them back-to-back and their intervals only touch"
+    )
+    assert seen_while_active, (
+        "while one embed was active the other must have been observed in-flight; "
+        "serial execution never has two embeds resident at once"
+    )
+    assert elapsed < 2 * gate, (
+        "concurrent embeds finish in ~one sleep, not ~two (serial); "
+        f"elapsed {elapsed:.3f}s over a 2x{gate}s serial sum"
     )

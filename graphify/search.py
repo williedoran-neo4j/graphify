@@ -13,6 +13,7 @@ import json
 import os
 from collections import OrderedDict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 
 def _stub_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
@@ -149,13 +150,16 @@ def search_vectors(
     if sidecar is None:
         return None
     allow = set(file_type) if file_type else None
-    per_space: list[dict] = []
-    for group, group_ids, group_vecs, raw_meta in (
+    groups = (
         ("text", sidecar["text_ids"], sidecar["text_vecs"], sidecar["text_meta"]),
         ("code", sidecar["code_ids"], sidecar["code_vecs"], sidecar["code_meta"]),
-    ):
-        if group_ids is None or group_vecs is None:
-            continue
+    )
+    present = [
+        g for g in groups if g[1] is not None and g[2] is not None
+    ]
+
+    def score_group(group: str, group_ids, group_vecs, raw_meta) -> list[dict]:
+        """Embed the query for one space and rank that space's rows."""
         try:
             meta = json.loads(str(raw_meta))
         except (ValueError, TypeError):
@@ -171,6 +175,16 @@ def search_vectors(
             if score >= min_score
             if allow is None or file_type_lookup(nid) in allow
         )
-        per_space.extend(sorted(rows, key=lambda r: r["score"], reverse=True))
-    merged = sorted(per_space, key=lambda r: r["score"], reverse=True)
+        return sorted(rows, key=lambda r: r["score"], reverse=True)
+
+    if len(present) == 1:
+        per_space = [score_group(*present[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            per_space = list(pool.map(score_group, *zip(*present)))
+    merged = sorted(
+        (r for rows in per_space for r in rows),
+        key=lambda r: r["score"],
+        reverse=True,
+    )
     return merged[:top_k]
