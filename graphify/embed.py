@@ -84,12 +84,29 @@ _embed_cache_hits = 0
 _embed_cache_corrupt = 0
 
 
-def build_node_text(graph, nid: str, node: dict) -> str | None:
-    """Compose a text-family node's deterministic 4-line embedding text.
+def _read_code_source(source_path: Path) -> str | None:
+    """Read a code source file as text, or ``None`` if it cannot be read.
+
+    Missing, unreadable, and undecodable files all return ``None`` (never
+    raise): the caller falls through to the attribute-only text.
+    """
+    try:
+        return source_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def build_node_text(graph, nid: str, node: dict, root: str | os.PathLike | None = None) -> str | None:
+    """Compose a text-family node's deterministic embedding text.
 
     ``{label}`` / ``{source_file}[:{source_location}]`` / ``{rationale}`` (only
     when present) / the neighbour line from ``_neighbour_text`` — joined with
     ``"\\n"``. Returns ``None`` for any non-text-family type.
+
+    A ``code`` node's text additionally appends the raw contents of
+    ``source_file`` (resolved against ``root``) after the skeleton, with the
+    whole string truncated to ``_NODE_TEXT_CAP_CHARS``; an unreadable source
+    file falls through to the attribute-only text.
     """
     if node.get("file_type") not in _TEXT_FILE_TYPES:
         return None
@@ -103,7 +120,19 @@ def build_node_text(graph, nid: str, node: dict) -> str | None:
     neighbours = _neighbour_text(graph, nid, limit=10)
     budget = max(0, _NODE_TEXT_CAP_CHARS - sum(len(line) for line in lines) - len(lines))
     lines.append(_cap_neighbour_line(neighbours, budget))
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if node.get("file_type") == "code" and root is not None:
+        source_name = node.get("source_file")
+        if source_name:
+            source_path = Path(source_name) if Path(source_name).is_absolute() else Path(root) / str(source_name)
+            source_text = _read_code_source(source_path)
+        else:
+            source_text = None
+        if source_text is not None:
+            text = f"{text}\n{source_text}"
+            if len(text) > _NODE_TEXT_CAP_CHARS:
+                text = text[:_NODE_TEXT_CAP_CHARS]
+    return text
 
 
 _STUB_DIM = 8

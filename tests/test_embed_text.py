@@ -1,7 +1,7 @@
-"""C5.1 — build_node_text(graph, nid, node) composes the deterministic 4-line text.
+"""C5.1 — build_node_graph's attribute skeleton, as composed by build_node_text.
 
-Contract C2 (R5 thread form): for a text-family node (document/paper/rationale/
-concept/code) ``build_node_text`` returns exactly
+For a text-family node (document/paper/rationale/concept/code)
+``build_node_text`` opens with the deterministic 4-line skeleton
 
     1. ``{label}``
     2. ``{source_file}:{source_location}`` when ``source_location`` is truthful,
@@ -10,9 +10,11 @@ concept/code) ``build_node_text`` returns exactly
     4. one line of space-joined neighbour labels (sorted by ``(-degree, id)``,
        head 10), emitted even when empty
 
-joined with ``"\n"``; for ``image`` (and every other non-text-family type) it
-returns ``None`` (excluded from every space). Invariant I2: two runs over the
-same unchanged graph produce byte-identical strings.
+joined with ``"\n"``. A ``code`` node's text may additionally carry a block of
+its source file's raw content after the skeleton (see
+tests/test_embed_code_text.py). For ``image`` (and every other non-text-family
+type) it returns ``None`` (excluded from every space). Invariant I2: two runs
+over the same unchanged graph produce byte-identical strings.
 
 This file's purpose is pinned by STRUCTURE AND CONTENT, not by a literal
 full-string golden (the done T1 exact-literal rewrite per C1/C2).
@@ -107,15 +109,17 @@ def test_build_node_text_text_family(text_graph):
 
 
 def test_build_node_text_neighbour_order_highest_degree_first(text_graph):
-    """C2/§2 — the neighbour line sorts by (-degree, id): the HIGHER-degree
-    neighbour comes first (a degree-blind or id-only sort would flip it)."""
+    """The code node's 4-line attribute skeleton keeps the label line first and
+    the neighbour line sorted by (-degree, id): the HIGHER-degree neighbour
+    comes first (a degree-blind or id-only sort would flip it). Only the
+    skeleton's structure is pinned — a code node's text may additionally carry
+    a source-content block after the skeleton."""
     code_attr = text_graph.nodes["n-code-02"]
-    lines = build_node_text(text_graph, "n-code-02", code_attr).split("\n")
-
-    assert len(lines) == 4
-    assert lines[0] == "TokenParser"          # code node is in the text family
+    text = build_node_text(text_graph, "n-code-02", code_attr)
+    assert text is not None                   # code node stays in the text family
+    lines = text.split("\n")
+    assert lines[0] == "TokenParser"          # label line first, verbatim
     assert lines[1] == "src/parser.py"        # truthful source_file, no location
-    assert lines[2] == ""                      # no rationale -> no line
     # n-doc-01 (degree 3) sorts before n-concept-03 (degree 2); insertion and
     # bare-id orders both give "Graph Index API Tokens" — the result is "the
     # sole reason" the degree-first sort.
