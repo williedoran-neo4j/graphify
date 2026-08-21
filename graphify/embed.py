@@ -213,38 +213,38 @@ def _guard_dim_consistency(vectors: list[list[float]]) -> None:
             )
 
 
-def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
-    """Write the text-space ``embeddings.npz`` sidecar next to ``graph_path``.
+def _embed_group(
+    graph, cache_root: Path, space: str, root: Path | None
+) -> tuple[list[str], np.ndarray, dict]:
+    """Embed one space's nodes and return ``(ids, vecs, meta)`` for the sidecar.
 
-    Text-family nodes (sorted by id) are embedded via ``_call_embeddings`` and
-    written with ``numpy.savez`` as ``text_ids`` / ``text_vecs`` (float32) /
-    ``text_meta`` (JSON string). Returns the written sidecar path.
+    Nodes whose space maps to ``space`` (``_embed_space``) are sorted by id and
+    their C1-constructed texts are embedded through ``_call_embeddings`` under
+    the space's own ``(backend, model)`` namespace, serving hits from the
+    write-cache first. An empty group yields ``([], empty_vecs, {})`` and never
+    touches the seam.
     """
-    import json
-    from datetime import datetime, timezone
-    from importlib.metadata import version as _pkg_version
-
     import numpy as np
+
+    backend, model = ("ollama", "nomic-embed-code") if space == "code" else (
+        "ollama",
+        "nomic-embed-text",
+    )
 
     texts: list[str] = []
     ids: list[str] = []
     for nid in sorted(graph.nodes):
         attrs = graph.nodes[nid]
-        text = build_node_text(graph, str(nid), attrs)
+        if _embed_space(attrs.get("file_type")) != space:
+            continue
+        text = build_node_text(graph, str(nid), attrs, root=root)
         if text is not None:
             ids.append(str(nid))
             texts.append(text)
 
-    try:
-        graphify_version = _pkg_version("graphifyy")
-    except Exception:
-        graphify_version = "unknown"
+    if not texts:
+        return [], np.array([], dtype=np.float32), {}
 
-    # R4/C4.2 — serve hits from the embed write-cache first; only MISSING
-    # texts reach the seam. root anchors graphify-out/ (Path(graph_path).parent).
-    # Zero texts (or an all-hit set) never calls ``_call_embeddings``.
-    backend, model = "ollama", "nomic-embed-text"
-    cache_root = Path(graph_path).parent
     cached: list[list[float] | None] = []
     missing_texts: list[str] = []
     for text in texts:
@@ -253,12 +253,12 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
         if vec is None:
             missing_texts.append(text)
 
+    # R4/C4.2 — only MISSING texts reach the seam; an all-hit set calls nothing.
     if missing_texts:
         rebuilt = _call_embeddings(backend=backend, model=model, inputs=missing_texts)
     else:
         rebuilt = []
 
-    # Reassemble the full matrix in text order (hits + rebuilt rows).
     vec_rows: list[list[float]] = []
     rebuilt_iter = iter(rebuilt)
     for vec in cached:
@@ -271,21 +271,52 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
         save_embedding(backend, model, text, vec, cache_root)
 
     vecs = np.asarray(vec_rows, dtype=np.float32)
-    meta = {
-        "model": "nomic-embed-text",
-        "backend": "ollama",
+    return ids, vecs, {
+        "model": model,
+        "backend": backend,
         "dim": vecs.shape[1],
-        "graphify_version": graphify_version,
-        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
+
+def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
+    """Write the ``embeddings.npz`` sidecar next to ``graph_path``.
+
+    Nodes are partitioned by their embedding space (``_embed_space``): the
+    ``text_*`` group (``text_ids`` / ``text_vecs`` float32 L2-normalized /
+    ``text_meta`` JSON) holds every ``"text"``-space node, and the ``code_*``
+    group (``code_ids`` / ``code_vecs`` / ``code_meta``) holds every
+    ``"code"``-space node under its own ``(ollama, nomic-embed-code)`` model.
+    Nodes whose file_type maps to no space are written to neither group. An
+    empty group is omitted entirely. Returns the written sidecar path.
+    """
+    import json
+    from datetime import datetime, timezone
+    from importlib.metadata import version as _pkg_version
+
+    import numpy as np
+
+    cache_root = Path(graph_path).parent
+    try:
+        graphify_version = _pkg_version("graphifyy")
+    except Exception:
+        graphify_version = "unknown"
+
+    groups = {}
+    for space in ("text", "code"):
+        ids, vecs, meta = _embed_group(graph, cache_root, space, root=cache_root)
+        if not ids:
+            continue
+        meta["graphify_version"] = graphify_version
+        meta["created_at"] = datetime.now(timezone.utc).isoformat()
+        groups[space] = (ids, vecs, meta)
+
     npz_path = Path(graph_path).parent / "embeddings.npz"
-    np.savez(
-        npz_path,
-        text_ids=np.array(ids, dtype=str),
-        text_vecs=_l2_normalize(vecs),
-        text_meta=json.dumps(meta),
-    )
+    arrays: dict[str, object] = {}
+    for space, (ids, vecs, meta) in groups.items():
+        arrays[f"{space}_ids"] = np.array(ids, dtype=str)
+        arrays[f"{space}_vecs"] = _l2_normalize(vecs)
+        arrays[f"{space}_meta"] = json.dumps(meta)
+    np.savez(npz_path, **arrays)
     return npz_path
 
 
