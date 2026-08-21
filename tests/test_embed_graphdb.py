@@ -640,3 +640,65 @@ def test_embedding_code_reads_code_group_row_not_text_row(monkeypatch, tmp_path)
     }
     assert legacy_pushed["code1"]["embedding_code"] == code_text_row.tolist()
     assert legacy_pushed["doc1"]["embedding_text"] == doc_text_row.tolist()
+
+
+def test_neo4j_push_code_only_sidecar_absent_text_group(monkeypatch, tmp_path):
+    """A code-only first-run sidecar -- ``code_ids``/``code_vecs``/``code_meta``
+    present, NO ``text_*`` group -- must still push cleanly. The embedding
+    index and per-space dims are built from the groups that exist, so the code
+    node's ``embedding_code`` carries its own ``code_vecs`` row, exactly the
+    code-space vector index is emitted dimensioned from ``code_meta["dim"]``,
+    and no text-space index statement appears. A text-family node cannot carry
+    ``embedding_text`` (the sidecar holds no text rows), and the absent group
+    must never raise ``KeyError``.
+    """
+    import numpy as np
+
+    G = nx.Graph()
+    G.add_node("code1", label="module.py", file_type="code")
+    G.add_node("doc1", label="report", file_type="document")
+    G.add_edge("code1", "doc1", relation="references")
+
+    code_code_row = np.array([0.3, -0.2, 0.7], dtype=np.float32)
+    sidecar = tmp_path / "embeddings.npz"
+    np.savez(
+        sidecar,
+        code_ids=np.array(["code1"]),
+        code_vecs=np.array([code_code_row], dtype=np.float32),
+        code_meta=np.str_('{"dim": 3}'),
+    )
+    # The fixture shapes of the two groups are irrelevant here -- a code-only
+    # sidecar has no text group at all, so no text row can leak anywhere.
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    counts = push_to_neo4j(
+        G,
+        uri="bolt://localhost:7687",
+        user="neo4j",
+        password="pw",
+        embeddings_path=sidecar,
+    )
+
+    # The push completes -- the absent text group never raises KeyError.
+    assert counts == {"nodes": 2, "edges": 1}
+
+    push_log = [(q, p) for kind, q, p in log if kind == "neo4j"]
+    pushed = {p["id"]: p["props"] for q, p in push_log if "SET n +=" in q}
+    # The code node's embedding_code is its own code_vecs row...
+    assert pushed["code1"]["embedding_code"] == code_code_row.tolist()
+    # ...and it carries no text-space prop.
+    assert "embedding_text" not in pushed["code1"]
+    # A text-family node carries no embedding_text either: the sidecar has no
+    # text rows to draw from.
+    assert "embedding_text" not in pushed["doc1"]
+    assert "embedding_code" not in pushed["doc1"]
+
+    # Exactly one vector index, for the code space only, dimensioned from the
+    # code group's meta -- never a text-space index.
+    ddl = [q for q, _ in push_log if "CREATE VECTOR INDEX" in q]
+    assert len(ddl) == 1
+    code_ddl = ddl[0]
+    assert "embedding_code" in code_ddl
+    assert "embedding_text" not in code_ddl
+    assert _integer_tokens(code_ddl) == {3}

@@ -19,7 +19,7 @@ def _embedding_index(embeddings_path):
     ``text_vecs`` (the "text" space) or ``code_ids`` / ``code_vecs`` (the
     "code" space), so an id maps only to its own group's row. A sidecar with
     no code group (pre-R8) falls back to the text row for every id, as the
-    exporter always did.
+    exporter always did; a sidecar with no text group maps the code rows only.
     """
     if embeddings_path is None:
         return None
@@ -28,19 +28,24 @@ def _embedding_index(embeddings_path):
         return None
     import numpy as np
 
-    text_ids = sidecar["text_ids"]
-    text_vecs = np.asarray(sidecar["text_vecs"])
-    include = {
-        str(nid): {"text": row.tolist()}
-        for nid, row in zip(text_ids, text_vecs, strict=False)
-    }
+    include = {}
+    text_ids = sidecar.get("text_ids")
+    text_vecs = sidecar.get("text_vecs")
+    if text_ids is not None and text_vecs is not None:
+        text_vecs = np.asarray(text_vecs)
+        include.update(
+            {
+                str(nid): {"text": row.tolist()}
+                for nid, row in zip(text_ids, text_vecs, strict=False)
+            }
+        )
     code_ids = sidecar.get("code_ids")
     code_vecs = sidecar.get("code_vecs")
     if code_ids is not None and code_vecs is not None:
         code_vecs = np.asarray(code_vecs)
         for nid, row in zip(code_ids, code_vecs, strict=False):
-            include[str(nid)]["code"] = row.tolist()
-    else:
+            include.setdefault(str(nid), {})["code"] = row.tolist()
+    elif include:
         for entry in include.values():
             entry["code"] = entry["text"]
     if not include:
@@ -49,17 +54,25 @@ def _embedding_index(embeddings_path):
 
 
 def _sidecar_dim(embeddings_path):
-    """Return each space's sidecar ``meta["dim"]``: ``{"text": dim,
-    "code": dim}``, or None when no sidecar."""
+    """Return each present space's sidecar ``meta["dim"]``: ``{"text": dim,
+    "code": dim}``, or None when no sidecar.
+
+    A pre-code sidecar has no code group; the code space reuses the text dim
+    (and, in _embedding_index, the text row) exactly as it always did. A
+    sidecar with no text group yields ``{"code": dim}`` only.
+    """
     if embeddings_path is None:
         return None
     sidecar = load_sidecar(embeddings_path)
     if sidecar is None:
         return None
-    text_dim = int(json.loads(str(sidecar["text_meta"]))["dim"])
-    # A pre-code sidecar has no code group; the code space reuses the text
-    # dim (and, in _embedding_index, the text row) exactly as it always did.
-    dims = {"text": text_dim, "code": text_dim}
+    dims = {}
+    text_meta = sidecar.get("text_meta")
+    if text_meta is not None:
+        text_dim = int(json.loads(str(text_meta))["dim"])
+        # A pre-code sidecar has no code group; the code space reuses the text
+        # dim (and, in _embedding_index, the text row) exactly as it always did.
+        dims = {"text": text_dim, "code": text_dim}
     code_meta = sidecar.get("code_meta")
     if code_meta is not None:
         dims["code"] = int(json.loads(str(code_meta))["dim"])

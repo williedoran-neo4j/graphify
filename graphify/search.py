@@ -65,16 +65,17 @@ def load_sidecar(path: str | os.PathLike) -> dict | None:
     """Load the embeddings sidecar ``.npz``, or ``None`` when it is absent.
 
     Returns the stored arrays: ``text_ids`` (unicode ids), ``text_vecs``
-    (float32 rows) and ``text_meta`` (a JSON string under the writer). Since
-    the sidecar gained a code-space group, ``code_ids`` / ``code_vecs`` /
-    ``code_meta`` are returned too when present, else ``None`` so a pre-code
-    sidecar loads unchanged. numpy is imported inside the function so module
-    import never pulls it in (serve.py's lazy-load guard depends on that).
+    (float32 rows) and ``text_meta`` (a JSON string under the writer). A group
+    absent from the archive (the writer omits an empty group) returns ``None``
+    for its keys, so a pre-code text-only sidecar loads unchanged and a
+    code-only sidecar loads with ``text_*`` == ``None``. numpy is imported
+    inside the function so module import never pulls it in (serve.py's lazy-load
+    guard depends on that).
 
     Enforces the dim-consistency invariant at the single load chokepoint
-    (RT7): when the stored ``text_meta["dim"]`` disagrees with
-    ``text_vecs.shape[1]``, raises ``ValueError`` instead of letting a
-    dimension mix flow onward.
+    (RT7): when a present group's ``meta["dim"]`` disagrees with its
+    ``vecs.shape[1]``, raises ``ValueError`` instead of letting a dimension
+    mix flow onward.
     """
     import numpy as np
 
@@ -82,18 +83,24 @@ def load_sidecar(path: str | os.PathLike) -> dict | None:
     if not os.path.exists(npz_path):
         return None
     with np.load(npz_path, allow_pickle=False) as data:
-        text_ids = data["text_ids"]
-        text_vecs = data["text_vecs"]
-        text_meta = data["text_meta"]
+        text_ids = data["text_ids"] if "text_ids" in data.files else None
+        text_vecs = data["text_vecs"] if "text_vecs" in data.files else None
+        text_meta = data["text_meta"] if "text_meta" in data.files else None
         code_ids = data["code_ids"] if "code_ids" in data.files else None
         code_vecs = data["code_vecs"] if "code_vecs" in data.files else None
         code_meta = data["code_meta"] if "code_meta" in data.files else None
-    meta = json.loads(str(text_meta))
-    if int(meta["dim"]) != int(text_vecs.shape[1]):
-        raise ValueError(
-            f"sidecar embeddings.npz meta dim {int(meta['dim'])} "
-            f"does not match stored text_vecs width {int(text_vecs.shape[1])}"
-        )
+    for name, meta, vecs in (
+        ("text", text_meta, text_vecs),
+        ("code", code_meta, code_vecs),
+    ):
+        if meta is not None and vecs is not None:
+            meta_dict = json.loads(str(meta))
+            if int(meta_dict["dim"]) != int(vecs.shape[1]):
+                raise ValueError(
+                    f"sidecar embeddings.npz meta dim {int(meta_dict['dim'])} "
+                    f"does not match stored {name}_vecs width "
+                    f"{int(vecs.shape[1])}"
+                )
     return {
         "text_ids": text_ids,
         "text_vecs": text_vecs,
