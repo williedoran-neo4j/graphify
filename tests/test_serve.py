@@ -4,7 +4,12 @@ import unicodedata
 
 import pytest
 import networkx as nx
+import numpy as np
 from networkx.readwrite import json_graph
+
+pytest.importorskip("mcp")
+
+from mcp.types import CallToolRequest, CallToolRequestParams  # noqa: E402
 
 from graphify.serve import (
     _strip_diacritics,
@@ -27,6 +32,7 @@ from graphify.serve import (
     _query_terms,
     _query_graph_text,
     _resolve_context_filters,
+    _QueryScores,
     _subgraph_to_text,
     _cut_lines_to_budget,
     _load_graph,
@@ -1711,3 +1717,122 @@ def test_underscore_query_does_not_let_a_single_token_outrank_the_real_match():
     scored = _score_nodes(G, _query_terms("user_service_client"))
     assert scored, "the multi-token query must match the full-label node"
     assert scored[0][1] == "real", f"a single-token node out-ranked the real match: {scored}"
+
+
+def test_query_graph_blend_gate_threads_semantic_weight(monkeypatch):
+    """The query-graph path carries a semantic blend weight through to the
+    scoring surface, defaulting to 0.0 and leaving the scoring pipeline
+    otherwise unchanged. This is the gate that will later hold semantic
+    scoring at the closed setting until measured (weight 0 -> today's output).
+    """
+    G = _make_graph()
+    original_sq = _score_query
+
+    recorded = []
+
+    def recording_sq(*args, **kwargs):
+        recorded.append((args, kwargs))
+        return original_sq(*args, **kwargs)
+
+    monkeypatch.setattr("graphify.serve._score_query", recording_sq)
+
+    # Explicit nonzero weight must reach _score_query, and the default must be 0.0.
+    state = {}
+
+    def check_sq(*args, **kwargs):
+        wrapped = _score_query(*args, **kwargs)
+        state["qs"] = wrapped
+        return wrapped
+
+    monkeypatch.setattr("graphify.serve._score_query", check_sq)
+    text = _query_graph_text(G, "user_service_client", mode="bfs", depth=1)
+    threading_weight = state["qs"].semantic_weight
+    assert text == "No matching nodes found."
+    assert isinstance(threading_weight, float) and threading_weight == 0.0
+    assert isinstance(state["qs"], _QueryScores)
+
+    # Re-record exactly one _score_query call per query with its kwargs intact.
+    recorded.clear()
+    monkeypatch.setattr("graphify.serve._score_query", recording_sq)
+    _query_graph_text(G, "extract", mode="bfs", depth=1, semantic_weight=0.25)
+    assert len(recorded) == 1
+    call_args, call_kwargs = recorded[0]
+    # Same G/terms as any ordinary query — the weight is a pure addition.
+    assert call_args[1] == ["extract"], f"query terms changed under the blend gate: {call_args}"
+    assert call_kwargs.get("semantic_weight") == 0.25, (
+        f"the resolved weight did not reach _score_query: {call_kwargs.get('semantic_weight')}"
+    )
+    assert call_kwargs.get("collect_per_term_seeds") is True, (
+        "the seed-collection path must be unchanged under the blend gate"
+    )
+
+
+def test_query_graph_gate_weight_zero_is_bit_identical(tmp_path, monkeypatch):
+    """The blend gate at weight 0.0 must render byte-for-byte the same whether
+    an embeddings sidecar sits beside the graph or not. The full serve query
+    path is driven through the MCP `query_graph` tool so the sidecar's active
+    graph path is what actually changes between the two arms."""
+    import asyncio
+    import math
+    from pathlib import Path
+
+    from graphify import serve as serve_mod
+    from graphify.embed import _STUB_DIM
+
+    node_labels = ("Alpha embed", "Beta embed", "Gamma embed")
+    fixture_types = ("document", "concept", "document")
+    ids = ("n-a-01", "n-b-02", "n-c-03")
+    g = {
+        "directed": True,
+        "nodes": [
+            {"id": ids[0], "label": node_labels[0], "source_file": "docs/a.md",
+             "file_type": fixture_types[0], "community": 0},
+            {"id": ids[1], "label": node_labels[1], "source_file": "docs/b.md",
+             "file_type": fixture_types[1], "community": 0},
+            {"id": ids[2], "label": node_labels[2], "source_file": "docs/c.md",
+             "file_type": fixture_types[2], "community": 0},
+        ],
+        "edges": [],
+    }
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    sidecar = corpus_dir / "embeddings.npz"
+    vectors = math.sqrt(3)
+    rows = np.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float32) / vectors
+    meta = {"model": "nomic-embed-text", "backend": "ollama", "dim": _STUB_DIM,
+            "graphify_version": "test", "created_at": "2026-08-18T00:00:00+00:00"}
+    np.savez(sidecar, text_ids=np.array(ids, dtype=str), text_vecs=rows,
+             text_meta=json.dumps(meta))
+    graph_file = corpus_dir / "graph.json"
+    graph_file.write_text(json.dumps(g), encoding="utf-8")
+
+    # First arm: sidecar ABSENT. The server's pinned default graph.json has no
+    # embeddings.npz sibling, so the query path sees no sidecar at all.
+    bare_dir = tmp_path / "no_sidecar"
+    bare_dir.mkdir()
+    bare_file = bare_dir / "graph.json"
+    bare_file.write_text(json.dumps(g), encoding="utf-8")
+    bare_server = serve_mod._build_server(str(bare_file))
+    bare = bare_server.request_handlers[CallToolRequest](
+        CallToolRequest(params=CallToolRequestParams(name="query_graph", arguments={"question": "alpha", "mode": "bfs", "depth": 1}))
+    )
+    if asyncio.iscoroutine(bare):
+        bare = asyncio.run(bare)
+    bare_text = bare.root.content[0].text
+
+    # Second arm: SAME graph with the embeddings.npz sidecar beside it. The
+    # serve query path must behave exactly as the absent arm at the default
+    # blend weight (0.0) — byte-identical rendered output, no blend.
+    sidecar_server = serve_mod._build_server(str(graph_file))
+    closed = sidecar_server.request_handlers[CallToolRequest](
+        CallToolRequest(params=CallToolRequestParams(name="query_graph", arguments={"question": "alpha", "mode": "bfs", "depth": 1}))
+    )
+    if asyncio.iscoroutine(closed):
+        closed = asyncio.run(closed)
+    closed_text = closed.root.content[0].text
+
+    assert bare_text == closed_text, (
+        "query_graph at the default weight must render byte-identically with and "
+        "without a sidecar beside the graph"
+    )
+    assert "Start:" in closed_text, "the serve query path must have rendered normally"
