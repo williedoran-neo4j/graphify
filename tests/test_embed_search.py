@@ -778,3 +778,165 @@ def test_search_vectors_query_embed_lru_keyed_model_and_text(tmp_path):
         ("different phrase", "nomic-embed-text"),
         ("same phrase", "text-embedding-3-small"),
     ], calls
+
+
+CODE_IDS = ("c-a-01", "c-b-02")
+CODE_LABELS = ("CA Code", "CB Code")
+CODE_FILES = ("src/ca.py", "src/cb.py")
+
+
+def _write_dual_sidecar(tmp_path: Path) -> Path:
+    """embeddings.npz carrying BOTH a text group (the standard fixture rows) and
+    a code group, so a search has two subspaces to rank.
+
+    The code rows live in the (e0, e2) plane and both have unit norm, so under
+    the canonical stub embed (q[0]=1.0, q[2]=0.5, score == dot(q, row)) they
+    score c-a-01 = 0.6 - 0.4 = 0.2 and c-b-02 = 0.8 + 0.3 = 1.1. The code rows
+    are stored ASCENDING (0.2 then 1.1) so a per-space-scored-descending order
+    must come from a real sort. Every text score (2.0 / 1.0 / 0.5) stays
+    distinct from the code scores, giving the merged series
+    2.0 -> 1.1 -> 1.0 -> 0.5 -> 0.2 that interleaves the two spaces.
+    """
+    meta = {
+        "model": "nomic-embed-text",
+        "backend": "ollama",
+        "dim": _STUB_DIM,
+        "graphify_version": "test",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    }
+    code_vecs = np.array(
+        [
+            [0.6, 0.0, -0.8, 0.0, 0.0, 0.0, 0.0, 0.0],  # c-a-01 -> 0.2
+            [0.8, 0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0],  # c-b-02 -> 1.1
+        ],
+        dtype=np.float32,
+    )
+    path = tmp_path / "embeddings.npz"
+    np.savez(
+        path,
+        text_ids=np.array(IDS, dtype=str),
+        text_vecs=_ORTHO,
+        text_meta=json.dumps(meta),
+        code_ids=np.array(CODE_IDS, dtype=str),
+        code_vecs=code_vecs,
+        code_meta=json.dumps({**meta, "model": "qwen2.5-coder"}),
+    )
+    return path
+
+
+def _dual_graph_file(tmp_path: Path) -> Path:
+    """graph.json carrying the 3 text nodes PLUS the 2 code nodes, so the render
+    can join labels and file_types for the code rows exactly as for text rows."""
+    g = {
+        "directed": True,
+        "nodes": [
+            {"id": IDS[0], "label": LABELS[0], "source_file": SOURCE_FILES[0],
+             "file_type": FILE_TYPES[0], "community": 0},
+            {"id": IDS[1], "label": LABELS[1], "source_file": SOURCE_FILES[1],
+             "file_type": FILE_TYPES[1], "community": 0},
+            {"id": IDS[2], "label": LABELS[2], "source_file": SOURCE_FILES[2],
+             "file_type": FILE_TYPES[2], "community": 0},
+            {"id": CODE_IDS[0], "label": CODE_LABELS[0], "source_file": CODE_FILES[0],
+             "file_type": "code", "community": 0},
+            {"id": CODE_IDS[1], "label": CODE_LABELS[1], "source_file": CODE_FILES[1],
+             "file_type": "code", "community": 0},
+        ],
+        "edges": [],
+    }
+    path = tmp_path / "graph.json"
+    path.write_text(json.dumps(g), encoding="utf-8")
+    return path
+
+
+def test_search_vectors_merges_code_and_text_spaces(tmp_path):
+    """Semantic search ranks the UNION of the code and text subspaces, not just
+    the text group. Every result row carries its own `space` label; rows are
+    score-descending within each space, and both spaces' rows interleave in ONE
+    global score-descending list cut whole-batch by `top_k`, with `min_score`
+    applied across both groups before the cut. The serve render must then show
+    `[code]` AND `[text]` lines in the same output.
+
+    Fixture scores under the canonical stub embed: n-b-02 2.0, c-b-02 1.1,
+    n-a-01 1.0, n-c-03 0.5, c-a-01 0.2. The global top-3 cut is 2.0 / 1.1 / 1.0
+    (one code row interleaving two text rows), and a min_score of 0.6 keeps
+    2.0 / 1.1 / 1.0 — the 0.5 text row and the 0.2 code row both drop, so both
+    spaces must still be represented after the whole-batch filter. Today only
+    the text group is scored, so every "both spaces present" arm is red.
+    """
+    sidecar = _write_dual_sidecar(tmp_path)
+
+    rows = search_vectors(sidecar, "query", space="text")
+    assert {r["space"] for r in rows} == {"text", "code"}, (
+        "the merged result must carry rows from BOTH subspaces; the code group "
+        f"is never scored today — got {[(r['id'], r['space']) for r in rows]!r}"
+    )
+    assert {r["id"] for r in rows if r["space"] == "text"} == set(IDS)
+    assert {r["id"] for r in rows if r["space"] == "code"} == set(CODE_IDS)
+    scores = [r["score"] for r in rows]
+    assert scores == sorted(scores, reverse=True), (
+        "the merged list must be ONE score-descending series (the two spaces "
+        f"interleave); got {[(r['space'], r['score']) for r in rows]!r}"
+    )
+    # Per-space descending, pinned so a per-space stored-order walk cannot pass.
+    for group in ("text", "code"):
+        grouped = [r["score"] for r in rows if r["space"] == group]
+        assert grouped == sorted(grouped, reverse=True), (
+            f"rows within the {group} space must be score-descending, got {grouped!r}"
+        )
+
+    # Whole-batch min_score: the 0.5 text row AND the 0.2 code row drop, while
+    # both spaces still keep a survivor above the threshold.
+    clipped = search_vectors(sidecar, "query", space="text", min_score=0.6)
+    assert {r["space"] for r in clipped} == {"text", "code"}, (
+        "min_score must apply across BOTH groups after the merge — c-b-02 (1.1) "
+        "and n-b-02/n-a-01 (2.0/1.0) survive while c-a-01 (0.2) and n-c-03 (0.5) "
+        f"drop; got {[(r['id'], r['space']) for r in clipped]!r}"
+    )
+    assert all(r["score"] >= 0.6 for r in clipped)
+    assert {r["id"] for r in clipped} == {"n-b-02", "c-b-02", "n-a-01"}
+
+    # Whole-batch top_k: the global top-3 cut (2.0, 1.1, 1.0) interleaves the
+    # spaces — a per-space cut would keep a different set / length.
+    cut = search_vectors(sidecar, "query", space="text", top_k=3)
+    assert len(cut) == 3, (
+        "top_k must cut the MERGED list whole-batch, not each space separately; "
+        f"got {len(cut)} rows: {[(r['id'], r['score']) for r in cut]!r}"
+    )
+    assert {r["space"] for r in cut} == {"text", "code"}, (
+        "the global top three (2.0, 1.1, 1.0) include the c-b-02 code row; got "
+        f"{[(r['id'], r['space']) for r in cut]!r}"
+    )
+    cut_scores = [r["score"] for r in cut]
+    assert cut_scores == sorted(cut_scores, reverse=True)
+
+    # Render surface: BOTH a [code] and a [text] line in the same output. The
+    # tool's default min_score (0.3) drops only c-a-01's 0.2, so four rows
+    # render: n-b-02 2.0, c-b-02 1.1, n-a-01 1.0, n-c-03 0.5.
+    _write_dual_sidecar(tmp_path)
+    server = serve_mod._build_server(str(_dual_graph_file(tmp_path)))
+    result_text = _invoke_semantic_search(server, query="query")
+    assert "[code]" in result_text and "[text]" in result_text, (
+        "a dual-group search must render [code] AND [text] lines together; the "
+        f"code group is never scored today — got {result_text!r}"
+    )
+    lines = result_text.splitlines()
+    assert len(lines) == 4, (
+        f"expected the 4 rows above default min_score 0.3, got {lines!r}"
+    )
+    pinned_render = re.compile(r"(\d+\.\d{3})  \[(code|text)\]  (\S+)  (.+)  \((\w+)\)")
+    rendered_scores: list[float] = []
+    rendered_ids: list[str] = []
+    for line in lines:
+        m = pinned_render.fullmatch(line)
+        assert m, (
+            f"{line!r} does not match the per-row `[{space}]` render surface "
+            "(every line carries its own space literal)"
+        )
+        rendered_scores.append(float(m.group(1)))
+    assert rendered_scores == sorted(rendered_scores, reverse=True), (
+        "rendered rows must stay score-descending down the whole merged list"
+    )
+    assert "CB Code" in result_text, (
+        f"the surviving code row (c-b-02, score 1.1) must render its graph "
+        f"label; got {result_text!r}"
+    )

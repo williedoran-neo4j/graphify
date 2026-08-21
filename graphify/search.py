@@ -133,35 +133,44 @@ def search_vectors(
 
     Returns a list of ``{"id", "score", "space"}`` rows (the handler joins them
     to the graph's nodes for label/file_type), or ``None`` when the sidecar is
-    absent. ``min_score`` drops rows strictly below the threshold before the
-    ``file_type`` allow-set (each row's type resolved through the injected
-    ``file_type_lookup``), then results are sorted score-descending and cut
-    to ``top_k``.``. ``preloaded`` supplies already-loaded sidecar arrays so a
-    caller can memoize them across calls; when absent the sidecar is loaded
-    from ``path`` on every call (the graph-agnostic default).
+    absent. Each present group (``text`` and ``code``) is scored against a query
+    embed from its own space's model, ranked score-descending, and the groups'
+    rows then merge into ONE global score-descending list. ``min_score`` drops
+    rows strictly below the threshold and ``top_k`` cuts the count — both apply
+    across the merged list, after the per-space rank (``file_type`` resolves
+    each row's type through the injected ``file_type_lookup``). ``preloaded``
+    supplies already-loaded sidecar arrays so a caller can memoize them across
+    calls; when absent the sidecar is loaded from ``path`` on every call (the
+    graph-agnostic default).
     """
     import numpy as np
 
     sidecar = preloaded if preloaded is not None else load_sidecar(path)
     if sidecar is None:
         return None
-    text_ids = sidecar["text_ids"]
-    text_vecs = sidecar["text_vecs"]
-    try:
-        meta = json.loads(str(sidecar["text_meta"]))
-    except (ValueError, TypeError):
-        meta = {}
-    q = np.asarray(
-        _embed_query_cached(query_embed, query, space=space, meta=meta),
-        dtype=np.float32,
-    )
-    scores = text_vecs @ q
     allow = set(file_type) if file_type else None
-    rows = (
-        {"id": str(nid), "score": float(score), "space": space}
-        for nid, score in zip(text_ids, scores, strict=False)
-        if score >= min_score
-        if allow is None or file_type_lookup(nid) in allow
-    )
-    ranked = sorted(rows, key=lambda r: r["score"], reverse=True)
-    return ranked[:top_k]
+    per_space: list[dict] = []
+    for group, group_ids, group_vecs, raw_meta in (
+        ("text", sidecar["text_ids"], sidecar["text_vecs"], sidecar["text_meta"]),
+        ("code", sidecar["code_ids"], sidecar["code_vecs"], sidecar["code_meta"]),
+    ):
+        if group_ids is None or group_vecs is None:
+            continue
+        try:
+            meta = json.loads(str(raw_meta))
+        except (ValueError, TypeError):
+            meta = {}
+        q = np.asarray(
+            _embed_query_cached(query_embed, query, space=group, meta=meta),
+            dtype=np.float32,
+        )
+        scores = group_vecs @ q
+        rows = (
+            {"id": str(nid), "score": float(score), "space": group}
+            for nid, score in zip(group_ids, scores, strict=False)
+            if score >= min_score
+            if allow is None or file_type_lookup(nid) in allow
+        )
+        per_space.extend(sorted(rows, key=lambda r: r["score"], reverse=True))
+    merged = sorted(per_space, key=lambda r: r["score"], reverse=True)
+    return merged[:top_k]
