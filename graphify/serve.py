@@ -285,6 +285,11 @@ _EXACT_MATCH_BONUS = 1000.0
 _PREFIX_MATCH_BONUS = 100.0
 _SUBSTRING_MATCH_BONUS = 1.0
 _SOURCE_MATCH_BONUS = 0.5
+# Upper bound on the semantic fold for a node that exactly matches no query
+# token. Stays below `_EXACT_MATCH_BONUS * idf` (the per-token exact tier),
+# so a semantically-near node joins the ranking but can never out-rank an
+# exact hit at any gate weight.
+_SEMANTIC_LIFT_CAP = _EXACT_MATCH_BONUS * 0.5
 
 
 def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
@@ -466,6 +471,7 @@ def _score_query(
     *,
     collect_per_term_seeds: bool,
     semantic_weight: float = 0.0,
+    semantic_scores: dict[str, float] | None = None,
 ) -> _QueryScores:
     """Single-pass combined scorer that optionally also records the best seed
     for each normalized query token.
@@ -492,6 +498,13 @@ def _score_query(
     trigram candidate set (needles `norm_terms + [joined]`) is a superset of
     each per-token `[t]` candidate set, so iterating combined candidates
     discovers every non-zero singleton-score node for every term.
+
+    The semantic blend is a per-node add-weight term on top of the lexical
+    score: each node contributes `semantic_scores[nid] * semantic_weight` to its
+    combined score and, when `collect_per_term_seeds` is on, to every per-token
+    singleton it also contributes to. At weight 0.0 (or with the sidecar absent —
+    `semantic_scores` empty/None) the fold is exactly zero, so the whole ranking
+    reduces to the pre-blend lexical output, byte-identical.
     """
     scored: list[tuple[float, str]] = []
     # Dedupe tokens, order-preserving (as _pick_seeds already does): a repeated
@@ -540,6 +553,21 @@ def _score_query(
         # this preserves the single-query-time perf where nid_lower was lazy.
         nid_lower = nid.lower() if (joined or collect_per_term_seeds) else ""
         score = 0.0
+        exact_match = False
+        # Gated semantic contribution for this node (zero at the closed weight
+        # or when the sidecar's scores were never pulled). Folded into the
+        # combined score and into every nonzero per-token singleton below, so a
+        # semantically-near node with no lexical tie can still earn a seed slot.
+        # Cap the semantic lift for nodes that exactly match no query token so
+        # it cannot leapfrog an exact hit (the per-token exact tier starts at
+        # `_EXACT_MATCH_BONUS * idf`, min ~405; the cap sits at 500). Once any
+        # token exact-matches, the fold stays uncapped on top of the dominant
+        # exact tier.
+        semantic_lift = (
+            semantic_scores.get(nid, 0.0) * semantic_weight if semantic_scores else 0.0
+        )
+        if semantic_lift and not exact_match:
+            semantic_lift = min(semantic_lift, _SEMANTIC_LIFT_CAP)
         # Full-query tier: a multi-word query that equals (or prefixes) the whole
         # label must dominate the per-token bag-of-words sums below, so `path`/
         # `query` resolve the same node `explain` does (via _find_node). Without
@@ -581,6 +609,8 @@ def _score_query(
             substr_value = 0.0
             source_value = 0.0
             if t == norm_label or t == bare_label:
+                exact_match = True
+            if t == norm_label or t == bare_label:
                 tier_value = _EXACT_MATCH_BONUS * w
                 matched += 1
             elif norm_label.startswith(t) or bare_label.startswith(t):
@@ -613,6 +643,8 @@ def _score_query(
                     singleton = 0.0
                 singleton += tier_value + substr_value + source_value
                 if singleton > 0:
+                    if semantic_lift:
+                        singleton += semantic_lift
                     # Tie-break key mirrors the legacy sort+max(degree):
                     # (-singleton, -degree, label_len, nid) — the minimum
                     # tuple wins, exactly matching max(tied, key=degree)
@@ -623,6 +655,8 @@ def _score_query(
                         best_by_term[t] = (key, nid)
         if tiered:
             score += tiered * (matched / n_terms) ** 2
+        if semantic_lift:
+            score += semantic_lift
         if score > 0:
             scored.append((score, nid))
     # Sort by score desc; break ties toward the shorter label so a concise exact
@@ -631,7 +665,6 @@ def _score_query(
     best_seed_by_term: dict[str, str] = {}
     if collect_per_term_seeds and best_by_term:
         best_seed_by_term = {t: nid for t, (_key, nid) in best_by_term.items()}
-    del semantic_weight
     return _QueryScores(ranked=scored, best_seed_by_term=best_seed_by_term)
 
 
@@ -1178,6 +1211,7 @@ def _query_graph_text(
     token_budget: int = 2000,
     context_filters: list[str] | None = None,
     semantic_weight: float = 0.0,
+    semantic_scores: dict[str, float] | None = None,
 ) -> str:
     terms = _query_terms(question)
     # One graph scoring pass produces both the combined ranking (used to drive
@@ -1187,7 +1221,11 @@ def _query_graph_text(
     # time; on a 100k-node, three-term benchmark ~71% of scoring time was
     # spent in those redundant per-term passes.
     qs = _score_query(
-        G, terms, collect_per_term_seeds=True, semantic_weight=semantic_weight
+        G,
+        terms,
+        collect_per_term_seeds=True,
+        semantic_weight=semantic_weight,
+        semantic_scores=semantic_scores,
     )
     # Relational-intent verbs ("calls", "uses", ...) describe the relation the
     # question asks about, not a symbol to seed from; drop them from the
@@ -1481,6 +1519,27 @@ def _community_header(cid: int, community_name) -> str:
     return base
 
 
+def _query_graph_semantic_scores(question: str, graph_path: str) -> dict[str, float]:
+    """Rank every sidecar row against the question and return per-node text-space
+    cosine scores — the semantic half of the query_graph blend. An absent sidecar
+    returns ``{}`` so the caller's weight-0 gate (and the escaped default path)
+    is an exact no-op.
+
+    ``graph_path`` is the current graph's json path; its sibling
+    ``embeddings.npz`` is where the sidecar lives. ``search_vectors`` stays the
+    graph-agnostic seam (function-local import keeps serve.py's lazy-load
+    discipline); the loaded sidecar is not memoized here, mirroring the query
+    path's one-pull-per-call cost for a feature that is off at the default
+    weight.
+    """
+    from graphify.search import search_vectors
+
+    rows = search_vectors(Path(graph_path).parent / "embeddings.npz", question, space="text")
+    if not rows:
+        return {}
+    return {r["id"]: r["score"] for r in rows}
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -1726,6 +1785,17 @@ def _build_server(graph_path: str):
         depth = min(int(arguments.get("depth", 3)), 6)
         budget = int(arguments.get("token_budget", 2000))
         context_filter = arguments.get("context_filter")
+        # The blend gate: a nonzero semantic_weight (a float passed as a string
+        # by MCP clients) turns the query into a blend — semantic near-misses
+        # from the sibling embeddings.npz fold into the ranking behind that
+        # weight. The default (absent argument) keeps the pure-lexical path,
+        # bit-identical to the pre-blend output.
+        semantic_weight = float(arguments.get("semantic_weight", 0.0) or 0.0)
+        semantic_scores = (
+            _query_graph_semantic_scores(question, graph_path=active_graph_path)
+            if semantic_weight
+            else None
+        )
         _t0 = _time.perf_counter()
         result = _query_graph_text(
             G,
@@ -1734,6 +1804,8 @@ def _build_server(graph_path: str):
             depth=depth,
             token_budget=budget,
             context_filters=context_filter,
+            semantic_weight=semantic_weight,
+            semantic_scores=semantic_scores,
         )
         querylog.log_query(
             kind="mcp_query",
