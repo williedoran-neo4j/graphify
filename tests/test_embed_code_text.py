@@ -156,3 +156,114 @@ def test_build_node_text_code_missing_source_file_does_not_raise(tmp_path):
             _neighbour_text(graph, "n-code-gone", limit=10),
         ]
     )
+
+
+def test_build_node_text_code_no_source_file_attribute_keeps_attribute_text(tmp_path):
+    """A code node whose ``source_file`` attribute is absent keeps the
+    attribute-only 4-line text (label / path / rationale-or-empty / neighbour
+    line) — no source-content block is appended and the call does not raise."""
+    graph = nx.Graph()
+    graph.add_node(
+        "n-code-plain",
+        id="n-code-plain",
+        label="Plain parser",
+        file_type="code",
+    )
+    graph.add_node(
+        "n-doc-01",
+        id="n-doc-01",
+        label="API Tokens",
+        source_file="docs/security.md",
+        file_type="document",
+    )
+    graph.add_edge("n-code-plain", "n-doc-01")
+
+    text = build_node_text(graph, "n-code-plain", graph.nodes["n-code-plain"], tmp_path)
+
+    assert text is not None
+    assert len(text) <= _NODE_TEXT_CAP_CHARS
+    lines = text.split("\n")
+    assert len(lines) == 4
+    assert lines[0] == "Plain parser"
+    assert lines[1] == ""
+    assert lines[2] == ""
+    assert lines[3] == _neighbour_text(graph, "n-code-plain", limit=10)
+    # The bare 4-line skeleton carries no source-content block.
+    assert _SOURCE_MARKER not in text
+
+
+def test_build_node_text_code_empty_source_file_keeps_attribute_text(tmp_path):
+    """A code node whose ``source_file`` attribute is an empty string keeps the
+    attribute-only 4-line text — no source-content block is appended and the
+    call does not raise."""
+    graph = nx.Graph()
+    graph.add_node(
+        "n-code-empty",
+        id="n-code-empty",
+        label="Empty parser",
+        source_file="",
+        file_type="code",
+    )
+    graph.add_node(
+        "n-doc-01",
+        id="n-doc-01",
+        label="API Tokens",
+        source_file="docs/security.md",
+        file_type="document",
+    )
+    graph.add_edge("n-code-empty", "n-doc-01")
+
+    text = build_node_text(graph, "n-code-empty", graph.nodes["n-code-empty"], tmp_path)
+
+    assert text is not None
+    assert len(text) <= _NODE_TEXT_CAP_CHARS
+    lines = text.split("\n")
+    assert len(lines) == 4
+    assert lines[0] == "Empty parser"
+    assert lines[1] == ""
+    assert lines[2] == ""
+    assert lines[3] == _neighbour_text(graph, "n-code-empty", limit=10)
+    # The bare 4-line skeleton carries no source-content block.
+    assert _SOURCE_MARKER not in text
+
+
+def test_build_node_text_code_undecodable_source_file_falls_back(tmp_path):
+    """A code node whose ``source_file`` resolves to a file that exists under
+    root but is not valid utf-8 never raises and falls back to the
+    attribute-only 4-line text — the undecodable file's content never appears
+    in the returned text."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "parser.py").write_bytes(
+        b"def parse_token(text: str):\n    return text\n\xc3bad\n"
+    )
+    graph = nx.Graph()
+    graph.add_node(
+        "n-code-bad",
+        id="n-code-bad",
+        label="Bad parser",
+        source_file="src/parser.py",
+        file_type="code",
+    )
+    graph.add_node(
+        "n-doc-01",
+        id="n-doc-01",
+        label="API Tokens",
+        source_file="docs/security.md",
+        file_type="document",
+    )
+    graph.add_edge("n-code-bad", "n-doc-01")
+
+    text = build_node_text(graph, "n-code-bad", graph.nodes["n-code-bad"], tmp_path)
+
+    assert text is not None
+    assert len(text) <= _NODE_TEXT_CAP_CHARS
+    lines = text.split("\n")
+    assert len(lines) == 4
+    assert lines[0] == "Bad parser"
+    assert lines[1] == "src/parser.py"
+    assert lines[2] == ""
+    assert lines[3] == _neighbour_text(graph, "n-code-bad", limit=10)
+    # The undecodable file holds this marker as its first line, so its
+    # absence proves the source block was dropped in favor of the attribute text.
+    assert _SOURCE_MARKER not in text
