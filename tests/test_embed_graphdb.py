@@ -513,3 +513,130 @@ def test_vector_index_emitted_once_per_space_failure_non_fatal(
     no_sidecar_push = [(q, p) for kind, q, p in no_sidecar_log if kind == "neo4j"]
     assert not [q for q, _ in no_sidecar_push if "CREATE VECTOR INDEX" in q]
     assert not [q for q, _ in no_sidecar_push if "SET n:Embedded" in q]
+
+
+def test_embedding_code_reads_code_group_row_not_text_row(monkeypatch, tmp_path):
+    """A code node's ``embedding_code`` must carry the sidecar's ``code_vecs``
+    row for its id -- never the ``text_vecs`` row -- while a text-family node's
+    ``embedding_text`` keeps its ``text_vecs`` row.
+
+    The exporter builds every sidecar entry from the ``text_*`` group alone and
+    reuses that one row for both the ``text`` and ``code`` slots, so today a
+    code node's ``embedding_code`` silently carries the text-space vector. This
+    fixture therefore writes the code node into BOTH groups with DIFFERENT rows:
+    the pushed ``embedding_code`` must equal the group's own row, not the text
+    row the old build splices in. The code node must also carry no
+    ``embedding_text`` (the per-space split), and each space's vector index
+    must be dimensioned by its own group. The no-sidecar push and a
+    pre-code-group (``text_*``-only) sidecar must keep pushing exactly as they
+    do today.
+    """
+    import numpy as np
+
+    G = nx.Graph()
+    G.add_node("doc1", label="report", file_type="document")
+    G.add_node("code1", label="module.py", file_type="code")
+    G.add_edge("doc1", "code1", relation="references")
+
+    doc_text_row = np.array([0.5, -0.5, 1.0, 0.0], dtype=np.float32)
+    code_text_row = np.array([1.0, 1.0, -1.0, 0.5], dtype=np.float32)
+    # The code group is a DIFFERENT model with a DIFFERENT width (3 vs the
+    # text group's 4): the code node's pushed vector must be this 3-wide row --
+    # never the 4-wide text row -- and the code-space index must be dimensioned
+    # 3, not the text group's 4.
+    code_code_row = np.array([0.3, -0.2, 0.7], dtype=np.float32)
+    # The two rows that could populate the code slot must genuinely differ;
+    # a matching-vector fixture could not tell the two read paths apart.
+    # (Different widths here: the text row is 4-wide, the code row 3-wide.)
+    assert code_text_row.shape != code_code_row.shape
+
+    sidecar = tmp_path / "embeddings.npz"
+    np.savez(
+        sidecar,
+        text_ids=np.array(["doc1", "code1"]),
+        text_vecs=np.array([doc_text_row, code_text_row], dtype=np.float32),
+        text_meta=np.str_('{"dim": 4}'),
+        code_ids=np.array(["code1"]),
+        code_vecs=np.array([code_code_row], dtype=np.float32),
+        code_meta=np.str_('{"dim": 3}'),
+    )
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(
+        G,
+        uri="bolt://localhost:7687",
+        user="neo4j",
+        password="pw",
+        embeddings_path=sidecar,
+    )
+    pushed = {
+        params["id"]: params["props"]
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    }
+
+    # The code node's embedding_code is the code group's own row -- never the
+    # text row the old text-only build spliced into the code slot. (The text
+    # row is 4-wide, the code row 3-wide, so the lists differ on length too.)
+    assert pushed["code1"]["embedding_code"] == code_code_row.tolist()
+    assert pushed["code1"]["embedding_code"] != code_text_row.tolist()
+    # Per-space split: a code node carries no text-space prop.
+    assert "embedding_text" not in pushed["code1"]
+
+    # The text-family node keeps its text group's row, and only that.
+    assert pushed["doc1"]["embedding_text"] == doc_text_row.tolist()
+    assert "embedding_code" not in pushed["doc1"]
+
+    # Each space's vector index is dimensioned by that space's own group: the
+    # code group's 3-wide rows must not be indexed under the text group's
+    # 4-dim setting (a shared dim would silently misdimension one search).
+    ddl = [
+        query
+        for kind, query, params in log
+        if kind == "neo4j" and "CREATE VECTOR INDEX" in query
+    ]
+    text_ddl = next(q for q in ddl if "embedding_text" in q)
+    code_ddl = next(q for q in ddl if "embedding_code" in q)
+    assert _integer_tokens(text_ddl) == {4}
+    assert _integer_tokens(code_ddl) == {3}
+
+    # No sidecar: today's exact behavior -- no embedding prop anywhere.
+    no_sidecar_log = []
+    _install_fake_neo4j(monkeypatch, no_sidecar_log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+    no_sidecar_props = {
+        params["id"]: params["props"]
+        for kind, query, params in no_sidecar_log
+        if kind == "neo4j" and "SET n +=" in query
+    }
+    for pid, props in no_sidecar_props.items():
+        assert not [k for k in props if k.startswith("embedding_")], (
+            f"node {pid} must carry no embedding prop without a sidecar"
+        )
+
+    # A text_*-only sidecar (pre-code-group shape): the code slot falls back to
+    # the text row exactly as it has always been pushed -- no regression.
+    legacy = tmp_path / "legacy.npz"
+    np.savez(
+        legacy,
+        text_ids=np.array(["doc1", "code1"]),
+        text_vecs=np.array([doc_text_row, code_text_row], dtype=np.float32),
+        text_meta=np.str_('{"dim": 4}'),
+    )
+    legacy_log = []
+    _install_fake_neo4j(monkeypatch, legacy_log)
+    push_to_neo4j(
+        G,
+        uri="bolt://localhost:7687",
+        user="neo4j",
+        password="pw",
+        embeddings_path=legacy,
+    )
+    legacy_pushed = {
+        params["id"]: params["props"]
+        for kind, query, params in legacy_log
+        if kind == "neo4j" and "SET n +=" in query
+    }
+    assert legacy_pushed["code1"]["embedding_code"] == code_text_row.tolist()
+    assert legacy_pushed["doc1"]["embedding_text"] == doc_text_row.tolist()

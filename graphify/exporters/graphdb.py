@@ -13,7 +13,14 @@ import re
 
 def _embedding_index(embeddings_path):
     """Map sidecar id -> {space: list of floats}, or None when no sidecar
-    was given or the given path holds no stored vectors."""
+    was given or the given path holds no stored vectors.
+
+    Each node id lives in exactly one sidecar group: ``text_ids`` /
+    ``text_vecs`` (the "text" space) or ``code_ids`` / ``code_vecs`` (the
+    "code" space), so an id maps only to its own group's row. A sidecar with
+    no code group (pre-R8) falls back to the text row for every id, as the
+    exporter always did.
+    """
     if embeddings_path is None:
         return None
     sidecar = load_sidecar(embeddings_path)
@@ -21,23 +28,42 @@ def _embedding_index(embeddings_path):
         return None
     import numpy as np
 
-    ids = sidecar["text_ids"]
-    vecs = np.asarray(sidecar["text_vecs"])
-    if len(ids) == 0:
-        return None
-    return {
-        str(nid): {"text": row.tolist(), "code": row.tolist()}
-        for nid, row in zip(ids, vecs, strict=False)
+    text_ids = sidecar["text_ids"]
+    text_vecs = np.asarray(sidecar["text_vecs"])
+    include = {
+        str(nid): {"text": row.tolist()}
+        for nid, row in zip(text_ids, text_vecs, strict=False)
     }
+    code_ids = sidecar.get("code_ids")
+    code_vecs = sidecar.get("code_vecs")
+    if code_ids is not None and code_vecs is not None:
+        code_vecs = np.asarray(code_vecs)
+        for nid, row in zip(code_ids, code_vecs, strict=False):
+            include[str(nid)]["code"] = row.tolist()
+    else:
+        for entry in include.values():
+            entry["code"] = entry["text"]
+    if not include:
+        return None
+    return include
+
 
 def _sidecar_dim(embeddings_path):
-    """Return the sidecar's ``meta["dim"]``, or None when no sidecar."""
+    """Return each space's sidecar ``meta["dim"]``: ``{"text": dim,
+    "code": dim}``, or None when no sidecar."""
     if embeddings_path is None:
         return None
     sidecar = load_sidecar(embeddings_path)
     if sidecar is None:
         return None
-    return int(json.loads(str(sidecar["text_meta"]))["dim"])
+    text_dim = int(json.loads(str(sidecar["text_meta"]))["dim"])
+    # A pre-code sidecar has no code group; the code space reuses the text
+    # dim (and, in _embedding_index, the text row) exactly as it always did.
+    dims = {"text": text_dim, "code": text_dim}
+    code_meta = sidecar.get("code_meta")
+    if code_meta is not None:
+        dims["code"] = int(json.loads(str(code_meta))["dim"])
+    return dims
 
 
 def _vector_index_ddl(space: str, dim: int) -> str:
@@ -50,10 +76,10 @@ def _vector_index_ddl(space: str, dim: int) -> str:
     )
 
 
-def _emit_vector_indexes(run, dim: int) -> None:
-    """Emit one vector index per space; a driver that cannot build the index
-    must not fail the push."""
-    for space in ("text", "code"):
+def _emit_vector_indexes(run, dims: dict) -> None:
+    """Emit one vector index per space, each dimensioned by its own sidecar
+    group's dim; a driver that cannot build the index must not fail the push."""
+    for space, dim in dims.items():
         try:
             result = run(_vector_index_ddl(space, dim))
             if result is not None and hasattr(result, "consume"):
@@ -131,7 +157,7 @@ def push_to_neo4j(
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
     embedding_index = _embedding_index(embeddings_path)
-    dim = _sidecar_dim(embeddings_path)
+    dims = _sidecar_dim(embeddings_path)
     nodes_pushed = 0
     edges_pushed = 0
 
@@ -153,8 +179,8 @@ def push_to_neo4j(
             )
             nodes_pushed += 1
 
-        if dim is not None:
-            _emit_vector_indexes(session.run, dim)
+        if dims is not None:
+            _emit_vector_indexes(session.run, dims)
 
         for u, v, data in G.edges(data=True):
             rel = _safe_rel(data.get("relation", "RELATED_TO"))
@@ -234,7 +260,7 @@ def push_to_falkordb(
     )
     graph = db.select_graph(graph_name)
     embedding_index = _embedding_index(embeddings_path)
-    dim = _sidecar_dim(embeddings_path)
+    dims = _sidecar_dim(embeddings_path)
     nodes_pushed = 0
     edges_pushed = 0
 
@@ -254,8 +280,8 @@ def push_to_falkordb(
         )
         nodes_pushed += 1
 
-    if dim is not None:
-        _emit_vector_indexes(graph.query, dim)
+    if dims is not None:
+        _emit_vector_indexes(graph.query, dims)
 
     for u, v, data in G.edges(data=True):
         rel = _safe_rel(data.get("relation", "RELATED_TO"))
