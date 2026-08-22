@@ -506,7 +506,7 @@ def _score_query(
     `semantic_scores` empty/None) the fold is exactly zero, so the whole ranking
     reduces to the pre-blend lexical output, byte-identical.
     """
-    scored: list[tuple[float, str]] = []
+    scored: list[tuple[float, str, bool]] = []
     # Dedupe tokens, order-preserving (as _pick_seeds already does): a repeated
     # query word must not double-count every tier, and with coverage scaling
     # below it would also inflate the matched-term ratio (#1602).
@@ -560,19 +560,10 @@ def _score_query(
         nid_lower = nid.lower() if (joined or collect_per_term_seeds) else ""
         score = 0.0
         exact_match = False
-        # Gated semantic contribution for this node (zero at the closed weight
-        # or when the sidecar's scores were never pulled). Folded into the
-        # combined score and into every nonzero per-token singleton below, so a
-        # semantically-near node with no lexical tie can still earn a seed slot.
-        # Cap the semantic lift for nodes that exactly match no query token so
-        # it cannot leapfrog an exact hit (the per-token exact tier starts at
-        # `_EXACT_MATCH_BONUS * idf`, min ~405; the cap sits at 500). Once any
-        # token exact-matches, the fold stays uncapped on top of the dominant
-        # exact tier.
         semantic_lift = (
             semantic_scores.get(nid, 0.0) * semantic_weight if semantic_scores else 0.0
         )
-        if semantic_lift and not exact_match:
+        if semantic_lift:
             semantic_lift = min(semantic_lift, _SEMANTIC_LIFT_CAP)
         # Full-query tier: a multi-word query that equals (or prefixes) the whole
         # label must dominate the per-token bag-of-words sums below, so `path`/
@@ -583,6 +574,7 @@ def _score_query(
         if joined:
             if joined in (norm_label, bare_label, label_tokens, nid_lower):
                 score += _EXACT_MATCH_BONUS * 10 * joined_w
+                exact_match = True
             elif (
                 norm_label.startswith(joined)
                 or bare_label.startswith(joined)
@@ -614,7 +606,7 @@ def _score_query(
             tier_value = 0.0
             substr_value = 0.0
             source_value = 0.0
-            if t == norm_label or t == bare_label:
+            if t == norm_label:
                 exact_match = True
             if t == norm_label or t == bare_label:
                 tier_value = _EXACT_MATCH_BONUS * w
@@ -664,14 +656,23 @@ def _score_query(
         if semantic_lift:
             score += semantic_lift
         if score > 0:
-            scored.append((score, nid))
-    # Sort by score desc; break ties toward the shorter label so a concise exact
-    # match beats a longer superset that happens to share the same score.
-    scored.sort(key=lambda s: (-s[0], len(G.nodes[s[1]].get("label") or s[1]), s[1]))
+            scored.append((score, nid, exact_match))
+    # Two-class sort: any node that hit the exact/joined tier outranks every node
+    # that did not, regardless of the arithmetic score. Within each class sort by
+    # score desc, then shorter label, then nid.
+    scored.sort(
+        key=lambda s: (
+            0 if s[2] else 1,
+            -s[0],
+            len(G.nodes[s[1]].get("label") or s[1]),
+            s[1],
+        )
+    )
     best_seed_by_term: dict[str, str] = {}
     if collect_per_term_seeds and best_by_term:
         best_seed_by_term = {t: nid for t, (_key, nid) in best_by_term.items()}
-    return _QueryScores(ranked=scored, best_seed_by_term=best_seed_by_term)
+    ranked = [(score, nid) for score, nid, _flag in scored]
+    return _QueryScores(ranked=ranked, best_seed_by_term=best_seed_by_term)
 
 
 def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: str) -> str:

@@ -325,3 +325,51 @@ def test_query_graph_blend_semantic_reaches_trigram_prefilter(tmp_path):
     assert open_.ranked[0][1] == "n-widget", (
         "the exact-label node must keep rank 1 behind the open gate"
     )
+
+
+def test_query_graph_blend_multiterm_exact_keeps_rank_one(tmp_path):
+    """On a multi-term query, the exact-label node matches only one term, so its
+    exact tier is coverage-scaled to a fraction. A rival with NO full-label
+    equality but partial lexical matches (prefix + substring + source) and a
+    saturated semantic lift must still rank below the exact-label node. The sort
+    must be two-class: any node that fires the exact/joined tier outranks every
+    node that did not, regardless of the semantic fold value.
+    """
+    G = nx.Graph()
+    G.add_node("n-exact", label="Widget", source_file="widget.py",
+               source_location="L1", community=0)
+    G.add_node("n-rival", label="Widget Analog Repeater",
+               source_file="widget-analog-repeater.py",
+               source_location="L1", community=0)
+    G.add_edge("n-exact", "n-rival", relation="calls", confidence="EXTRACTED")
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    # Rival vector aligned with the stub query embed (high semantic score);
+    # exact-node vector orthogonal (semantic score ~0).
+    qnorm = math.sqrt(1.0 ** 2 + 2.0 ** 2 + 0.5 ** 2)  # sqrt(5.25) ≈ 2.291
+    rows = np.array(
+        [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],   # exact: orthogonal
+         [1.0, 2.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]],  # rival: aligned
+        dtype=np.float32,
+    ) / qnorm
+    meta = {"model": "nomic-embed-text", "backend": "ollama", "dim": _STUB_DIM,
+            "graphify_version": "test", "created_at": "2026-08-18T00:00:00+00:00"}
+    np.savez(corpus / "embeddings.npz",
+             text_ids=np.array(["n-exact", "n-rival"], dtype=str),
+             text_vecs=rows, text_meta=json.dumps(meta))
+
+    semantic = _semantics(corpus / "embeddings.npz", "widget repeater")
+    assert semantic["n-rival"] > 0.0, "rival must carry a semantic lift"
+    assert semantic["n-exact"] == 0.0, "exact node must have zero semantic score"
+
+    open_ = _score_query(
+        G, ["widget", "repeater"], collect_per_term_seeds=True,
+        semantic_weight=10000, semantic_scores=semantic,
+    )
+    open_ids = [nid for _s, nid in open_.ranked]
+    assert "n-rival" in open_ids, "rival must join the ranking via semantic lift"
+    assert open_.ranked[0][1] == "n-exact", (
+        "the exact-label node must keep rank 1 even when a saturated semantic rival "
+        "outscores it arithmetically on a multi-term query: %r" % open_ids
+    )
