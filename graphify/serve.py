@@ -523,6 +523,12 @@ def _score_query(
     # identical either way — the per-node scoring below is unchanged and a
     # non-candidate node always scores 0. (IDF above stays a whole-graph statistic.)
     candidate_ids = _trigram_candidates(G, norm_terms + ([joined] if joined else []))
+    # C3: when the blend gate is open, widen the candidate set to every node
+    # carrying a semantic lift so purely-semantic near-misses aren't silently
+    # dropped by the trigram prefilter.
+    if semantic_weight and semantic_scores:
+        extra = set(semantic_scores) & set(G.nodes())
+        candidate_ids = list(set(candidate_ids) | extra) if candidate_ids is not None else list(extra)
     node_iter = (
         G.nodes(data=True) if candidate_ids is None
         else ((nid, G.nodes[nid]) for nid in candidate_ids)

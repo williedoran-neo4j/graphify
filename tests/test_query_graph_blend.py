@@ -238,3 +238,90 @@ def test_query_graph_blend_default_weight_unchanged_rendering(tmp_path, monkeypa
         "with and without a sidecar beside the graph"
     )
     assert "Start:" in blended, "the query path must have rendered its normal header"
+
+
+def test_query_graph_blend_semantic_reaches_trigram_prefilter(tmp_path):
+    """When the blend gate is open, a purely semantic near-miss whose text
+    shares no trigram with the query still enters the ranking, because the
+    candidate superset is widened to include every node carrying a semantic
+    lift. At the closed gate the prefilter remains unchanged and the near-
+    miss stays out, preserving the bit-identical baseline.
+    """
+    import graphify.serve as serve
+
+    # Build a 16-node graph so the trigram index is selective (thresh = 1).
+    # Only n-widget's search text contains the query trigrams; n-analog is
+    # excluded by the prefilter.
+    G = nx.Graph()
+    G.add_node("n-widget", label="Widget", source_file="widget.py",
+               source_location="L1", community=0)
+    G.add_node("n-analog", label="Analog Mechanism", source_file="analog.py",
+               source_location="L1", community=0)
+    other_nodes = [
+        ("n-alpha", "Alpha", "alpha.py"),
+        ("n-beta", "Beta", "beta.py"),
+        ("n-charlie", "Charlie", "charlie.py"),
+        ("n-delta", "Delta", "delta.py"),
+        ("n-echo", "Echo", "echo.py"),
+        ("n-foxtrot", "Foxtrot", "foxtrot.py"),
+        ("n-golf", "Golf", "golf.py"),
+        ("n-hotel", "Hotel", "hotel.py"),
+        ("n-india", "India", "india.py"),
+        ("n-juliet", "Juliet", "juliet.py"),
+        ("n-kilo", "Kilo", "kilo.py"),
+        ("n-lima", "Lima", "lima.py"),
+        ("n-mike", "Mike", "mike.py"),
+        ("n-november", "November", "november.py"),
+    ]
+    for nid, label, source in other_nodes:
+        G.add_node(nid, label=label, source_file=source,
+                   source_location="L1", community=0)
+    G.add_edge("n-widget", "n-analog", relation="calls", confidence="EXTRACTED")
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ianalog = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    vectors = math.sqrt(sum(c * c for c in ianalog))
+    rows = np.array(
+        [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+         [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]] +
+        [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]] * 14,
+        dtype=np.float32,
+    ) / vectors
+    meta = {"model": "nomic-embed-text", "backend": "ollama", "dim": _STUB_DIM,
+            "graphify_version": "test", "created_at": "2026-08-18T00:00:00+00:00"}
+    all_ids = ["n-widget", "n-analog"] + [nid for nid, _, _ in other_nodes]
+    np.savez(corpus / "embeddings.npz",
+             text_ids=np.array(all_ids, dtype=str),
+             text_vecs=rows, text_meta=json.dumps(meta))
+
+    semantic = _semantics(corpus / "embeddings.npz", "widget")
+    assert semantic["n-analog"] > semantic["n-widget"], "fixture must be a semantic near-miss"
+
+    # Verify the prefilter is selective and excludes n-analog
+    cands = serve._trigram_candidates(G, ["widget"])
+    assert cands is not None, "prefilter must return a proper subset, not None"
+    assert cands == ["n-widget"], (
+        "only n-widget should pass the trigram prefilter; got %r" % cands
+    )
+
+    closed = _score_query(G, ["widget"], collect_per_term_seeds=True)
+    closed_ids = [nid for _s, nid in closed.ranked]
+    assert "n-widget" in closed_ids
+    assert "n-analog" not in closed_ids, (
+        "n-analog must be excluded from the ranking at weight 0 "
+        "(no semantic union, prefilter excludes it)"
+    )
+
+    open_ = _score_query(
+        G, ["widget"], collect_per_term_seeds=True,
+        semantic_weight=10000, semantic_scores=semantic,
+    )
+    open_ids = [nid for _s, nid in open_.ranked]
+    assert "n-analog" in open_ids, (
+        "with the gate open, the semantic near-miss must join the ranking "
+        "even though the trigram prefilter excludes it: %r" % open_ids
+    )
+    assert open_.ranked[0][1] == "n-widget", (
+        "the exact-label node must keep rank 1 behind the open gate"
+    )
