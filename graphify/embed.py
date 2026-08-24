@@ -278,7 +278,7 @@ def _embed_group(
     }
 
 
-def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
+def enrich_embeddings(graph, graph_path: str | os.PathLike, root: str | os.PathLike | None = None) -> os.PathLike:
     """Write the ``embeddings.npz`` sidecar next to ``graph_path``.
 
     Nodes are partitioned by their embedding space (``_embed_space``): the
@@ -303,7 +303,7 @@ def enrich_embeddings(graph, graph_path: str | os.PathLike) -> os.PathLike:
 
     groups = {}
     for space in ("text", "code"):
-        ids, vecs, meta = _embed_group(graph, cache_root, space, root=cache_root)
+        ids, vecs, meta = _embed_group(graph, cache_root, space, root=root if root is not None else cache_root)
         if not ids:
             continue
         meta["graphify_version"] = graphify_version

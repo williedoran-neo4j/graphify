@@ -4048,6 +4048,32 @@ def dispatch_command(cmd: str) -> None:
         )
         stages.total()
 
+    elif cmd == "embed":
+        # Standalone re-embed of an existing graph.
+        if len(sys.argv) < 3:
+            print("Usage: graphify embed <path>", file=sys.stderr)
+            sys.exit(1)
+        target = Path(sys.argv[2]).resolve()
+        graph_path = target / _GRAPHIFY_OUT / "graph.json"
+        if not graph_path.exists():
+            print(f"error: graph file not found: {graph_path}", file=sys.stderr)
+            sys.exit(1)
+        import json as _json
+        from networkx.readwrite import json_graph
+        _raw = _json.loads(graph_path.read_text(encoding="utf-8"))
+        if "links" not in _raw and "edges" in _raw:
+            _raw = dict(_raw, links=_raw["edges"])
+        try:
+            G = json_graph.node_link_graph(_raw, edges="links")
+        except TypeError:
+            G = json_graph.node_link_graph(_raw)
+        if G.number_of_nodes() == 0:
+            print("No nodes to embed -- no-op.")
+            sys.exit(0)
+        from graphify.embed import enrich_embeddings
+        enrich_embeddings(G, graph_path, root=str(target))
+        print(f"Embedded {graph_path}")
+
     elif cmd == "cache-check":
         # graphify cache-check <files_from> [--root <dir>] [--mode <m> | --deep]
         #                       [--prompt-file <path>]
