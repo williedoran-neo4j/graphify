@@ -87,3 +87,33 @@ def test_embed_in_help_text(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "embed <path>" in out, "`embed <path>` command line missing from help text"
     assert "re-embed" in out, "`re-embed` description missing from embed help line"
+
+
+def test_embed_help_guard_redirects(monkeypatch, tmp_path, capsys):
+    """`graphify embed --help` hits the universal help guard because `embed`
+    is not in `_FREE_TEXT_CMDS`, prints the redirect message, and does not
+    run the embed command or write any sidecar files."""
+    nodes = [
+        (
+            "n-a-01",
+            {
+                "id": "n-a-01",
+                "label": "API Tokens",
+                "source_file": "docs/security.md",
+                "file_type": "concept",
+            },
+        ),
+    ]
+    graph_path = _write_graph(tmp_path, nodes)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        "graphify.embed._call_embeddings",
+        lambda backend, model, inputs: [[1.0] * 768] * len(inputs),
+    )
+    monkeypatch.setattr(mainmod.sys, "argv", ["graphify", "embed", str(tmp_path), "--help"])
+    monkeypatch.setenv("GRAPHIFY_OUT", str(graph_path.parent.relative_to(tmp_path)))
+    mainmod.main()
+    out = capsys.readouterr().out
+    assert "Run 'graphify --help' for full usage." in out
+    assert not graph_path.with_name("embeddings.npz").is_file()
+    assert "Embedded" not in out
