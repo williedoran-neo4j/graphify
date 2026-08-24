@@ -77,3 +77,13 @@ def test_embed_cli_zero_node_no_op(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert not backend_called
     assert "no-op" in out.lower() or "no nodes" in out.lower() or "empty" in out.lower() or "nothing" in out.lower()
+
+
+def test_embed_in_help_text(capsys, monkeypatch):
+    """`graphify --help` must list the `embed` command with its description."""
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", ["graphify", "--help"])
+    mainmod.main()
+    out = capsys.readouterr().out
+    assert "embed <path>" in out, "`embed <path>` command line missing from help text"
+    assert "re-embed" in out, "`re-embed` description missing from embed help line"
