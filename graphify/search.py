@@ -15,6 +15,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from graphify.embed import _call_embeddings, _l2_normalize
+
 
 def _stub_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
     # C4 query-embed stub: deterministic per query, satisfying q[1] > q[0] > q[2]
@@ -22,6 +24,20 @@ def _stub_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
     # backend lands in R3; until then the query string is deliberately ignored.
     del query, space, meta
     return [1.0, 2.0, 0.5, 0, 0, 0, 0, 0]
+
+
+def _real_query_embed(query: str, *, space: str, meta: dict) -> list[float]:
+    # Resolve backend/model from meta, falling back to space defaults
+    backend = meta.get("backend")
+    model = meta.get("model")
+    if backend is None or model is None:
+        backend = "ollama"
+        model = "nomic-embed-text" if space == "text" else "nomic-embed-code"
+    vectors = _call_embeddings(backend, model, [query])
+    vec = vectors[0]
+    import numpy as np
+    normalized = _l2_normalize(np.array([vec], dtype=np.float32))[0]
+    return normalized.tolist()
 
 
 # C3.3/RT6: bounded (model, text) -> vector cache over the injected query_embed

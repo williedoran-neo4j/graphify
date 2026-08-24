@@ -1015,3 +1015,40 @@ def test_search_vectors_embeds_dual_spaces_concurrently(tmp_path):
         "concurrent embeds finish in ~one sleep, not ~two (serial); "
         f"elapsed {elapsed:.3f}s over a 2x{gate}s serial sum"
     )
+
+
+def test_real_query_embed_resolves_backend_model_and_l2_normalizes(monkeypatch):
+    """A real query embed resolves backend/model from meta, falls back to space
+    defaults, and L2-normalizes the returned vector.
+
+    Arm A: explicit backend and model in meta must reach the embeddings seam.
+    Arm B: missing backend/model with space="text" falls back to ollama/nomic-embed-text.
+    Arm C: space="code" falls back to ollama/nomic-embed-code.
+    """
+    import numpy as np
+
+    mock_calls: list[tuple[str, str, list[str]]] = []
+
+    def fake_call_embeddings(backend: str, model: str, inputs: list[str]) -> list[list[float]]:
+        mock_calls.append((backend, model, inputs))
+        return [[3.0, 4.0, 0.0]]
+
+    monkeypatch.setattr(search_mod, "_call_embeddings", fake_call_embeddings)
+
+    # Arm A — explicit meta
+    vec = search_mod._real_query_embed("test", space="text", meta={"backend": "openai", "model": "text-embedding-3-small"})
+    assert mock_calls[-1] == ("openai", "text-embedding-3-small", ["test"])
+    assert isinstance(vec, list)
+    assert all(isinstance(v, float) for v in vec)
+    norm = np.linalg.norm(vec)
+    assert abs(norm - 1.0) < 1e-6, f"expected L2 norm 1.0, got {norm}"
+    assert len(vec) == 3
+    assert all(abs(v - e) < 1e-5 for v, e in zip(vec, [0.6, 0.8, 0.0])), f"got {vec!r}"
+
+    # Arm B — text fallback
+    search_mod._real_query_embed("hello", space="text", meta={})
+    assert mock_calls[-1] == ("ollama", "nomic-embed-text", ["hello"])
+
+    # Arm C — code fallback
+    search_mod._real_query_embed("def foo():", space="code", meta={})
+    assert mock_calls[-1] == ("ollama", "nomic-embed-code", ["def foo():"])
