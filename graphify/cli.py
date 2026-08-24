@@ -2863,6 +2863,7 @@ def dispatch_command(cmd: str) -> None:
         global_merge = False
         code_only = False
         no_gitignore = False
+        embed = False
         global_repo_tag: str | None = None
         # Performance/tuning knobs (issue #792). None means "use library default".
         cli_max_workers: int | None = None
@@ -2933,6 +2934,8 @@ def dispatch_command(cmd: str) -> None:
                 google_workspace = True; i += 1
             elif a == "--no-gitignore":
                 no_gitignore = True; i += 1
+            elif a == "--embed":
+                embed = True; i += 1
             elif a == "--global":
                 global_merge = True; i += 1
             elif a == "--as" and i + 1 < len(args):
@@ -3835,6 +3838,18 @@ def dispatch_command(cmd: str) -> None:
                 )
             except OSError:
                 pass
+            if embed:
+                import json as _json
+                from networkx.readwrite import json_graph
+                _raw = _json.loads(graph_json_path.read_text(encoding="utf-8"))
+                if "links" not in _raw and "edges" in _raw:
+                    _raw = dict(_raw, links=_raw["edges"])
+                try:
+                    G = json_graph.node_link_graph(_raw, edges="links")
+                except TypeError:
+                    G = json_graph.node_link_graph(_raw)
+                from graphify.embed import enrich_embeddings
+                enrich_embeddings(G, graph_json_path, root=str(target))
             stages.mark("write")
             cost = _estimate_cost(
                 backend, merged["input_tokens"], merged["output_tokens"]
@@ -3979,6 +3994,9 @@ def dispatch_command(cmd: str) -> None:
             )
         except OSError:
             pass
+        if embed:
+            from graphify.embed import enrich_embeddings
+            enrich_embeddings(G, graph_json_path, root=str(target))
         stages.mark("export")
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
