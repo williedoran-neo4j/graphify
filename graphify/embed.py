@@ -213,6 +213,17 @@ def _guard_dim_consistency(vectors: list[list[float]]) -> None:
             )
 
 
+def _embed_space_backend_model(space: str) -> tuple[str, str]:
+    """Resolve (backend, model) for an embedding space from env vars, with defaults."""
+    if space == "code":
+        backend = os.environ.get("GRAPHIFY_EMBED_CODE_BACKEND", "").strip() or "ollama"
+        model = os.environ.get("GRAPHIFY_EMBED_CODE_MODEL", "").strip() or "nomic-embed-code"
+    else:
+        backend = os.environ.get("GRAPHIFY_EMBED_TEXT_BACKEND", "").strip() or "ollama"
+        model = os.environ.get("GRAPHIFY_EMBED_TEXT_MODEL", "").strip() or "nomic-embed-text"
+    return (backend, model)
+
+
 def _embed_group(
     graph, cache_root: Path, space: str, root: Path | None
 ) -> tuple[list[str], np.ndarray, dict]:
@@ -226,10 +237,7 @@ def _embed_group(
     """
     import numpy as np
 
-    backend, model = ("ollama", "nomic-embed-code") if space == "code" else (
-        "ollama",
-        "nomic-embed-text",
-    )
+    backend, model = _embed_space_backend_model(space)
 
     texts: list[str] = []
     ids: list[str] = []
