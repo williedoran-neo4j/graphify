@@ -122,6 +122,10 @@ def test_query_graph_blend_semantic_near_miss_joins_ranking(tmp_path, monkeypatc
         return original(*args, **kwargs)
 
     monkeypatch.setattr("graphify.serve._score_query", recording)
+    monkeypatch.setattr(
+        "graphify.search._real_query_embed",
+        lambda query, *, space, meta: [1.0, 2.0, 0.5, 0, 0, 0, 0, 0],
+    )
     server = serve_mod._build_server(str(graph_file))
     text = _render(server, "widget", semantic_weight=10000)
 
@@ -372,4 +376,28 @@ def test_query_graph_blend_multiterm_exact_keeps_rank_one(tmp_path):
     assert open_.ranked[0][1] == "n-exact", (
         "the exact-label node must keep rank 1 even when a saturated semantic rival "
         "outscores it arithmetically on a multi-term query: %r" % open_ids
+    )
+
+
+def test_query_graph_semantic_scores_absent_sidecar_returns_empty_dict(tmp_path):
+    """When the embeddings sidecar is absent, `_query_graph_semantic_scores` must
+    return an empty dict so the blend fold is an exact no-op.
+
+    The helper resolves the sidecar path from the graph json's parent directory.
+    With no sibling ``embeddings.npz``, ``search_vectors`` returns ``None``; the
+    helper's ``if not rows: return {}`` short-circuit turns that into ``{}``.
+    """
+    import graphify.serve as serve
+
+    graph_dir = tmp_path / "graph_dir"
+    graph_dir.mkdir()
+    graph_file = graph_dir / "graph.json"
+    graph_file.write_text("{}", encoding="utf-8")
+
+    # Ensure no embeddings.npz sibling exists
+    assert not (graph_dir / "embeddings.npz").exists()
+
+    result = serve._query_graph_semantic_scores("some question", str(graph_file))
+    assert result == {}, (
+        "absent sidecar must return an empty dict; got %r" % result
     )
