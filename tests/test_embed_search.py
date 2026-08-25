@@ -261,14 +261,14 @@ def test_search_vectors_file_type_filter_reads_injected_lookup(tmp_path):
 
     The seam design: ``search_vectors(..., file_type_lookup=node_file_type)`` and
     the serve handler passes a closure over the live graph. ``node_file_type``
-    (search.py:87-90) currently returns ``""`` for EVERY id, so on today's code
+    (search.py:87-90) currently returns `""` for EVERY id, so on today's code
     any allow-set silently drops ALL rows — that is the red this test locks.
     ``search_vectors`` does not accept a ``file_type_lookup`` keyword yet, so the
     call itself fails (or, if green only adds an ignored/empty keyword, the
     per-lookup assertions fail). The lookup must be injected because the sole
     fixture file_type values are bound to the fixture ids; a filter hardcoded to
     those ids would pass the T9 arms and wrongly survive. The guard below maps
-    EVERY id to ``"video"`` and asserts ``file_type=["video"]`` keeps all three
+    EVERY id to `"video"` and asserts ``file_type=["video"]`` keeps all three
     rows AND that the score-desc order is preserved — only a filter that consults
     the actual injected lookup can pass while a hardcoded/inert filter cannot.
 
@@ -1121,4 +1121,93 @@ def test_semantic_search_handler_injects_real_query_embed(tmp_path, monkeypatch)
     )
     assert len(spy_calls) >= 1, (
         "the monkeypatched real helper must be invoked by the handler"
+    )
+
+
+def test_query_graph_blend_handler_injects_real_query_embed(tmp_path, monkeypatch):
+    """The _query_graph_semantic_scores helper must pass `query_embed=_real_query_embed`
+    to `search_vectors` so the query_graph blend path (nonzero semantic_weight) uses
+    the real backend seam, not the 8-dimensional test stub. A 3-dimensional
+    sidecar crashes under the stub (matmul size mismatch) but succeeds when the
+    real helper is injected and monkeypatched to return a compatible 3-dimensional
+    vector.
+    """
+    import json
+    import numpy as np
+    from collections import OrderedDict
+
+    import graphify.search as search_mod
+    from graphify import serve as serve_mod
+
+    # Clear the global query-embed cache so the handler must call the embedder.
+    monkeypatch.setattr(search_mod, "_QUERY_EMBED_CACHE", OrderedDict())
+
+    ids = ("n-a-01", "n-b-02", "n-c-03")
+    dim = 3
+    meta = {
+        "model": "test-model-3d",
+        "backend": "ollama",
+        "dim": dim,
+        "graphify_version": "test",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    }
+    vecs = np.eye(dim, dtype=np.float32)
+    np.savez(
+        tmp_path / "embeddings.npz",
+        text_ids=np.array(ids, dtype=str),
+        text_vecs=vecs,
+        text_meta=json.dumps(meta),
+    )
+
+    graph = {
+        "directed": True,
+        "nodes": [
+            {"id": ids[0], "label": "Alpha", "community": 0},
+            {"id": ids[1], "label": "Beta", "community": 0},
+            {"id": ids[2], "label": "Gamma", "community": 0},
+        ],
+        "edges": [],
+    }
+    (tmp_path / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    spy_calls = []
+
+    def fake_real_query_embed(query, *, space, meta):
+        spy_calls.append((query, space, meta))
+        # Return a 3-dim vector that scores highest on the second row.
+        return [0.0, 1.0, 0.0]
+
+    monkeypatch.setattr(search_mod, "_real_query_embed", fake_real_query_embed)
+
+    server = serve_mod._build_server(str(tmp_path / "graph.json"))
+
+    result_future = server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            params=CallToolRequestParams(
+                name="query_graph",
+                arguments={
+                    "question": "query",
+                    "mode": "bfs",
+                    "depth": 1,
+                    "semantic_weight": "1",
+                },
+            )
+        )
+    )
+    if asyncio.iscoroutine(result_future):
+        result = asyncio.run(result_future)
+    else:
+        result = result_future
+    result_text = result.root.content[0].text
+
+    assert "Error executing" not in result_text, (
+        f"the 8-dim stub against a 3-dim sidecar crashes and produces an error alias; "
+        f"got: {result_text!r}"
+    )
+    assert "Beta" in result_text, (
+        f"the injected real helper must produce a ranked result with the top-scoring node; "
+        f"got: {result_text!r}"
+    )
+    assert len(spy_calls) >= 1, (
+        "the monkeypatched real helper must be invoked by the blend handler"
     )

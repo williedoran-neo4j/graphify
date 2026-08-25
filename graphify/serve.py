@@ -1539,9 +1539,14 @@ def _query_graph_semantic_scores(question: str, graph_path: str) -> dict[str, fl
     path's one-pull-per-call cost for a feature that is off at the default
     weight.
     """
-    from graphify.search import search_vectors
+    from graphify.search import search_vectors, _real_query_embed
 
-    rows = search_vectors(Path(graph_path).parent / "embeddings.npz", question, space="text")
+    rows = search_vectors(
+        Path(graph_path).parent / "embeddings.npz",
+        question,
+        space="text",
+        query_embed=_real_query_embed,
+    )
     if not rows:
         return {}
     return {r["id"]: r["score"] for r in rows}
