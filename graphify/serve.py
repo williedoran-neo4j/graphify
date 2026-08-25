@@ -2031,7 +2031,7 @@ def _build_server(graph_path: str):
         # hot-reload that swaps in a fresh G naturally carries a fresh cache.
         # search.py stays graph-agnostic — only the arrays cross, via the
         # preloaded seam; the cache itself lives in the closure over G.
-        from graphify.search import load_sidecar, search_vectors
+        from graphify.search import load_sidecar, search_vectors, _real_query_embed
 
         query = arguments["query"]
         top_k = int(arguments.get("top_k", 10))
@@ -2066,6 +2066,7 @@ def _build_server(graph_path: str):
             # stays graph-agnostic — only the callable crosses the boundary.
             file_type_lookup=lambda nid: G.nodes[nid].get("file_type", ""),
             preloaded=preloaded,
+            query_embed=_real_query_embed,
         )
         if rows is None:
             # C2.8: absent sidecar (search_vectors returned None) -> the C4

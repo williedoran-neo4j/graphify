@@ -1052,3 +1052,73 @@ def test_real_query_embed_resolves_backend_model_and_l2_normalizes(monkeypatch):
     # Arm C — code fallback
     search_mod._real_query_embed("def foo():", space="code", meta={})
     assert mock_calls[-1] == ("ollama", "nomic-embed-code", ["def foo():"])
+
+
+def test_semantic_search_handler_injects_real_query_embed(tmp_path, monkeypatch):
+    """The _tool_semantic_search handler must pass `query_embed=_real_query_embed`
+    to `search_vectors` so the query is embedded through the real backend seam,
+    not the 8-dimensional test stub. A 3-dimensional sidecar crashes under the
+    stub (matmul size mismatch) but succeeds when the real helper is injected
+    and monkeypatched to return a compatible 3-dimensional vector.
+    """
+    import json
+    import numpy as np
+    from collections import OrderedDict
+
+    import graphify.search as search_mod
+    from graphify import serve as serve_mod
+
+    # Clear the global query-embed cache so the handler must call the embedder.
+    monkeypatch.setattr(search_mod, "_QUERY_EMBED_CACHE", OrderedDict())
+
+    ids = ("n-a-01", "n-b-02", "n-c-03")
+    dim = 3
+    meta = {
+        "model": "test-model-3d",
+        "backend": "ollama",
+        "dim": dim,
+        "graphify_version": "test",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    }
+    vecs = np.eye(dim, dtype=np.float32)
+    np.savez(
+        tmp_path / "embeddings.npz",
+        text_ids=np.array(ids, dtype=str),
+        text_vecs=vecs,
+        text_meta=json.dumps(meta),
+    )
+
+    graph = {
+        "directed": True,
+        "nodes": [
+            {"id": ids[0], "label": "Alpha", "community": 0},
+            {"id": ids[1], "label": "Beta", "community": 0},
+            {"id": ids[2], "label": "Gamma", "community": 0},
+        ],
+        "edges": [],
+    }
+    (tmp_path / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    spy_calls = []
+
+    def fake_real_query_embed(query, *, space, meta):
+        spy_calls.append((query, space, meta))
+        # Return a 3-dim vector that scores highest on the second row.
+        return [0.0, 1.0, 0.0]
+
+    monkeypatch.setattr(search_mod, "_real_query_embed", fake_real_query_embed)
+
+    server = serve_mod._build_server(str(tmp_path / "graph.json"))
+    result_text = _invoke_semantic_search(server, query="query")
+
+    assert "Error executing" not in result_text, (
+        f"the 8-dim stub against a 3-dim sidecar crashes and produces an error alias; "
+        f"got: {result_text!r}"
+    )
+    assert "n-b-02" in result_text, (
+        f"the injected real helper must produce a ranked result; "
+        f"got: {result_text!r}"
+    )
+    assert len(spy_calls) >= 1, (
+        "the monkeypatched real helper must be invoked by the handler"
+    )
