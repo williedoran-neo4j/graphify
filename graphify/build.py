@@ -210,9 +210,23 @@ def _fold_edge_aliases(edge: dict) -> None:
     is not provenance) and never a threshold mapping of the float. The
     ``confidence_score`` key itself is NOT popped: it is a legitimate companion
     field that the edge loop sanitizes and to_json round-trips.
+
+    A NUMERIC ``confidence`` (pre-enum graphs stored the LLM pass's float —
+    1.0/0.95/0.9/0.85 — directly in the field) normalizes to ``INFERRED``:
+    numeric confidences only ever came from the LLM semantic pass, and
+    LLM-derived edges are INFERRED by definition. The original float moves to
+    ``confidence_score`` unless an explicit one is already present (the
+    companion field is the authority). Without this fold, every reload of a
+    pre-enum graph re-warns once per legacy edge, forever. ``bool`` is
+    excluded despite subclassing ``int``: ``True`` is not a score.
     """
     if not edge.get("relation") and isinstance(edge.get("type"), str) and edge["type"]:
         edge["relation"] = edge.pop("type")
+    _conf = edge.get("confidence")
+    if isinstance(_conf, (int, float)) and not isinstance(_conf, bool):
+        if edge.get("confidence_score") is None:
+            edge["confidence_score"] = float(_conf)
+        edge["confidence"] = "INFERRED"
     if not edge.get("confidence") and edge.get("confidence_score") is not None:
         edge["confidence"] = "INFERRED"
 
@@ -425,7 +439,7 @@ def _infer_merge_root(graph_path: Path) -> str | None:
     try:
         marker = parent / ".graphify_root"
         if marker.exists():
-            recorded = marker.read_text(encoding="utf-8").strip()
+            recorded = marker.read_text(encoding="utf-8-sig").strip()
             if recorded:
                 return str(Path(recorded).resolve())
     except OSError:
@@ -1966,19 +1980,31 @@ def build_merge(
     return G
 
 
-def prefix_graph_for_global(G: nx.Graph, repo_tag: str) -> nx.Graph:
+def prefix_graph_for_global(
+    G: nx.Graph, repo_tag: str, community_offset: int = 0
+) -> nx.Graph:
     """Return a copy of G with all node IDs prefixed with repo_tag::.
 
     Labels are preserved unchanged (for display). A 'local_id' attribute
     is added to each node so the original ID can be recovered. Edges and
     their directional attributes (_src/_tgt) are rewritten to match the new
     prefixed IDs. The 'repo' attribute is set on every node.
+
+    community_offset shifts each node's integer 'community' id into a shared
+    id space and records the original in 'local_community': every input graph
+    numbers its communities from 0, so ids carried across a merge unchanged
+    collide and the aggregated community view fuses unrelated communities
+    into one meta-node (#3014). 0 (the default) leaves communities untouched.
     """
     relabel = {n: f"{repo_tag}::{n}" for n in G.nodes}
     H = nx.relabel_nodes(G, relabel, copy=True)
     for node, data in H.nodes(data=True):
         data["repo"] = repo_tag
         data.setdefault("local_id", node.split("::", 1)[1])
+        cid = data.get("community")
+        if community_offset and isinstance(cid, int):
+            data["local_community"] = cid
+            data["community"] = cid + community_offset
     for u, v, data in H.edges(data=True):
         if "_src" in data and data["_src"] in relabel:
             data["_src"] = relabel[data["_src"]]

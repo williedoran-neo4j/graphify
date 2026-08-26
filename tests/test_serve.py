@@ -1796,23 +1796,12 @@ def test_query_graph_gate_weight_zero_is_bit_identical(tmp_path, monkeypatch):
     }
     corpus_dir = tmp_path / "corpus"
     corpus_dir.mkdir()
-    sidecar = corpus_dir / "embeddings.npz"
-    vectors = math.sqrt(3)
-    rows = np.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float32) / vectors
-    meta = {"model": "nomic-embed-text", "backend": "ollama", "dim": _STUB_DIM,
-            "graphify_version": "test", "created_at": "2026-08-18T00:00:00+00:00"}
-    np.savez(sidecar, text_ids=np.array(ids, dtype=str), text_vecs=rows,
-             text_meta=json.dumps(meta))
     graph_file = corpus_dir / "graph.json"
     graph_file.write_text(json.dumps(g), encoding="utf-8")
 
     # First arm: sidecar ABSENT. The server's pinned default graph.json has no
     # embeddings.npz sibling, so the query path sees no sidecar at all.
-    bare_dir = tmp_path / "no_sidecar"
-    bare_dir.mkdir()
-    bare_file = bare_dir / "graph.json"
-    bare_file.write_text(json.dumps(g), encoding="utf-8")
-    bare_server = serve_mod._build_server(str(bare_file))
+    bare_server = serve_mod._build_server(str(graph_file))
     bare = bare_server.request_handlers[CallToolRequest](
         CallToolRequest(params=CallToolRequestParams(name="query_graph", arguments={"question": "alpha", "mode": "bfs", "depth": 1}))
     )
@@ -1823,6 +1812,13 @@ def test_query_graph_gate_weight_zero_is_bit_identical(tmp_path, monkeypatch):
     # Second arm: SAME graph with the embeddings.npz sidecar beside it. The
     # serve query path must behave exactly as the absent arm at the default
     # blend weight (0.0) — byte-identical rendered output, no blend.
+    sidecar = corpus_dir / "embeddings.npz"
+    vectors = math.sqrt(3)
+    rows = np.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float32) / vectors
+    meta = {"model": "nomic-embed-text", "backend": "ollama", "dim": _STUB_DIM,
+            "graphify_version": "test", "created_at": "2026-08-18T00:00:00+00:00"}
+    np.savez(sidecar, text_ids=np.array(ids, dtype=str), text_vecs=rows,
+             text_meta=json.dumps(meta))
     sidecar_server = serve_mod._build_server(str(graph_file))
     closed = sidecar_server.request_handlers[CallToolRequest](
         CallToolRequest(params=CallToolRequestParams(name="query_graph", arguments={"question": "alpha", "mode": "bfs", "depth": 1}))

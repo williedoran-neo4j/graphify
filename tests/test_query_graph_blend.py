@@ -186,6 +186,34 @@ def test_query_graph_blend_default_weight_unchanged_rendering(tmp_path, monkeypa
 
     corpus = tmp_path / "corpus"
     corpus.mkdir()
+    g = {
+        "directed": True,
+        "nodes": [
+            {"id": "n-widget", "label": "Widget", "source_file": "widget.py",
+             "source_location": "L1", "community": 0, "file_type": "concept"},
+            {"id": "n-analog", "label": "Analog Mechanism", "source_file": "analog.py",
+             "source_location": "L1", "community": 0, "file_type": "concept"},
+            {"id": "n-other", "label": "Unrelated Leaf", "source_file": "other.py",
+             "source_location": "L1", "community": 1, "file_type": "document"},
+        ],
+        "edges": [],
+    }
+    graph_file = corpus / "graph.json"
+    graph_file.write_text(json.dumps(g), encoding="utf-8")
+
+    calls = []
+    original = serve._query_graph_semantic_scores
+
+    def recording(question, graph_path, **kwargs):
+        calls.append((question, graph_path))
+        return original(question, graph_path, **kwargs)
+
+    monkeypatch.setattr(serve, "_query_graph_semantic_scores", recording)
+    # First arm: sidecar ABSENT — build and render before writing the sidecar.
+    without_sidecar = serve_mod._build_server(str(graph_file))
+    baseline = _render(without_sidecar, "widget")
+
+    # Second arm: SAME graph with the embeddings.npz sidecar beside it.
     vectors = math.sqrt(3)
     rows = np.array(
         [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -202,36 +230,8 @@ def test_query_graph_blend_default_weight_unchanged_rendering(tmp_path, monkeypa
     np.savez(corpus / "embeddings.npz",
              text_ids=np.array(["n-widget", "n-analog", "n-other"], dtype=str),
              text_vecs=rows, text_meta=json.dumps(meta))
-    g = {
-        "directed": True,
-        "nodes": [
-            {"id": "n-widget", "label": "Widget", "source_file": "widget.py",
-             "source_location": "L1", "community": 0, "file_type": "concept"},
-            {"id": "n-analog", "label": "Analog Mechanism", "source_file": "analog.py",
-             "source_location": "L1", "community": 0, "file_type": "concept"},
-            {"id": "n-other", "label": "Unrelated Leaf", "source_file": "other.py",
-             "source_location": "L1", "community": 1, "file_type": "document"},
-        ],
-        "edges": [],
-    }
-    graph_file = corpus / "graph.json"
-    graph_file.write_text(json.dumps(g), encoding="utf-8")
-    bare = corpus.parent / "bare"
-    bare.mkdir()
-    (bare / "graph.json").write_text(json.dumps(g), encoding="utf-8")
-
-    calls = []
-    original = serve._query_graph_semantic_scores
-
-    def recording(question, graph_path, **kwargs):
-        calls.append((question, graph_path))
-        return original(question, graph_path, **kwargs)
-
-    monkeypatch.setattr(serve, "_query_graph_semantic_scores", recording)
     with_sidecar = serve_mod._build_server(str(graph_file))
-    without_sidecar = serve_mod._build_server(str(bare / "graph.json"))
     blended = _render(with_sidecar, "widget")
-    baseline = _render(without_sidecar, "widget")
     assert calls == [], (
         "query_graph at the default blend weight (0.0) must leave the semantic "
         "sidecar unread — zero pulls of the semantic scores, not a pull that "
