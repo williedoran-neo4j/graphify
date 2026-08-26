@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from graphify.extractors.k8s import Dialect, detect_dialect
+from graphify.extractors.k8s import Dialect, detect_dialect, extract_k8s
 
 
 def test_detect_dialect_classifies_k8s_manifests_and_rejects_everything_else():
@@ -99,3 +99,127 @@ metadata:
 kind: MissingApiVersion
 """
     assert detect_dialect(p, mixed) is None
+
+
+def test_extract_k8s_emits_raw_id_nodes_with_attributes_and_ignores_non_k8s():
+    """extract_k8s emits one node per k8s manifest doc with raw k8s:// ids,
+    labels, file_type, source metadata, and attributes including containers.
+    Unknown kinds and namespace-less resources are accepted. Non-k8s YAML
+    returns empty nodes and edges."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+
+        # 1. Namespaced Deployment with mixed-case name and hyphen.
+        deployment = td_path / "deployment.yaml"
+        deployment.write_text(
+            """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+        - name: sidecar
+""",
+            encoding="utf-8",
+        )
+
+        # 2. Cluster-scoped / namespace-less resource (no metadata.namespace).
+        cluster_role = td_path / "clusterrole.yaml"
+        cluster_role.write_text(
+            """\
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: reader
+""",
+            encoding="utf-8",
+        )
+
+        # 3. Unknown/CRD kind (no containers, but still emitted).
+        custom = td_path / "custom.yaml"
+        custom.write_text(
+            """\
+apiVersion: example.com/v1
+kind: MyCustomResource
+metadata:
+  name: my-obj
+  namespace: custom-ns
+""",
+            encoding="utf-8",
+        )
+
+        # 4. Non-k8s YAML (GitHub Actions workflow, no apiVersion/kind).
+        non_k8s = td_path / "workflow.yaml"
+        non_k8s.write_text(
+            """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+""",
+            encoding="utf-8",
+        )
+
+        result_dep = extract_k8s(deployment)
+        result_cr = extract_k8s(cluster_role)
+        result_custom = extract_k8s(custom)
+        result_non = extract_k8s(non_k8s)
+
+        # Non-k8s must return empty.
+        assert result_non == {"nodes": [], "edges": []}
+
+        # Deployment assertions.
+        dep_nodes = result_dep["nodes"]
+        assert len(dep_nodes) == 1
+        dep = dep_nodes[0]
+        assert dep["id"] == "k8s://payments/Deployment/api-server"
+        assert dep["label"] == "Deployment/api-server"
+        assert dep["file_type"] == "k8s"
+        assert dep["source_file"] == str(deployment)
+        assert dep["source_location"] == "doc0"
+        assert dep["attributes"] == {
+            "kind": "Deployment",
+            "namespace": "payments",
+            "containers": ["app", "sidecar"],
+        }
+        assert result_dep["edges"] == []
+
+        # ClusterRole assertions (no namespace → "_cluster", no containers).
+        cr_nodes = result_cr["nodes"]
+        assert len(cr_nodes) == 1
+        cr = cr_nodes[0]
+        assert cr["id"] == "k8s://_cluster/ClusterRole/reader"
+        assert cr["label"] == "ClusterRole/reader"
+        assert cr["file_type"] == "k8s"
+        assert cr["source_file"] == str(cluster_role)
+        assert cr["source_location"] == "doc0"
+        assert cr["attributes"] == {
+            "kind": "ClusterRole",
+            "namespace": "_cluster",
+        }
+        assert "containers" not in cr["attributes"]
+        assert result_cr["edges"] == []
+
+        # Custom resource assertions.
+        custom_nodes = result_custom["nodes"]
+        assert len(custom_nodes) == 1
+        cu = custom_nodes[0]
+        assert cu["id"] == "k8s://custom-ns/MyCustomResource/my-obj"
+        assert cu["label"] == "MyCustomResource/my-obj"
+        assert cu["file_type"] == "k8s"
+        assert cu["source_file"] == str(custom)
+        assert cu["source_location"] == "doc0"
+        assert cu["attributes"] == {
+            "kind": "MyCustomResource",
+            "namespace": "custom-ns",
+        }
+        assert "containers" not in cu["attributes"]
+        assert result_custom["edges"] == []
