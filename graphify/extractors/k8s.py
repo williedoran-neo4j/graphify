@@ -161,6 +161,7 @@ def _resolve_k8s_references(
             continue
         namespace, kind, name = node_id[len("k8s://"):].split("/", 2)
         index[(namespace, kind, name)] = node_id
+    placeholder_ids = set()
     for entry in per_file:
         for candidate in entry.get("k8s_candidates") or []:
             if candidate.get("relation") != "references":
@@ -173,6 +174,36 @@ def _resolve_k8s_references(
                 )
             )
             if target is None:
+                unresolved_id = (
+                    f"k8s://{candidate['namespace']}/"
+                    f"{candidate['target_kind']}/{candidate['target_name']}#unresolved"
+                )
+                all_edges.append(
+                    {
+                        "source": (
+                            f"k8s://{candidate['namespace']}/"
+                            f"{candidate['source_kind']}/{candidate['source_name']}"
+                        ),
+                        "target": unresolved_id,
+                        "relation": "references",
+                        "confidence": "AMBIGUOUS",
+                        "source_file": candidate["source_file"],
+                    }
+                )
+                if unresolved_id not in placeholder_ids:
+                    placeholder_ids.add(unresolved_id)
+                    all_nodes.append(
+                        {
+                            "id": unresolved_id,
+                            "label": (
+                                f"{candidate['target_kind']}/"
+                                f"{candidate['target_name']} (unresolved)"
+                            ),
+                            "file_type": "k8s",
+                            "source_file": candidate["source_file"],
+                            "attributes": {"unresolved": True},
+                        }
+                    )
                 continue
             all_edges.append(
                 {

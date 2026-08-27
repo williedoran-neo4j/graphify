@@ -565,3 +565,156 @@ def test_resolve_k8s_references_emits_exact_references_edges_with_extracted_conf
     _resolve_k8s_references(empty_per_file, all_nodes, empty_edges)
     assert empty_edges == []
 
+
+def test_resolve_k8s_references_emits_ambiguous_edges_and_placeholder_nodes_for_unresolved():
+    """Unresolved references (absent or in a different namespace) emit an AMBIGUOUS
+    edge with a #unresolved target id, plus a deduplicated placeholder node for
+    that target. Resolved references still produce EXTRACTED edges and no
+    placeholder."""
+    all_nodes = [
+        # Resolved: same-namespace target.
+        {
+            "id": "k8s://payments/ConfigMap/same-ns-cm",
+            "label": "ConfigMap/same-ns-cm",
+            "file_type": "k8s",
+            "source_file": "cm.yaml",
+            "attributes": {"kind": "ConfigMap", "namespace": "payments"},
+        },
+        # Wrong-namespace target: exists in "other", not in "payments".
+        {
+            "id": "k8s://other/ConfigMap/envfrom-cm",
+            "label": "ConfigMap/envfrom-cm",
+            "file_type": "k8s",
+            "source_file": "other/cm.yaml",
+            "attributes": {"kind": "ConfigMap", "namespace": "other"},
+        },
+    ]
+
+    per_file = [
+        {
+            "nodes": [],
+            "edges": [],
+            "k8s_candidates": [
+                # 1. Resolved cleanly → EXTRACTED edge, no placeholder.
+                {
+                    "target_name": "same-ns-cm",
+                    "target_kind": "ConfigMap",
+                    "namespace": "payments",
+                    "relation": "references",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "api-server",
+                },
+                # 2. Wrong-namespace → AMBIGUOUS edge + placeholder.
+                {
+                    "target_name": "envfrom-cm",
+                    "target_kind": "ConfigMap",
+                    "namespace": "payments",
+                    "relation": "references",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "api-server",
+                },
+                # 3. Absent entirely → AMBIGUOUS edge + placeholder.
+                {
+                    "target_name": "missing-cm",
+                    "target_kind": "ConfigMap",
+                    "namespace": "payments",
+                    "relation": "references",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "api-server",
+                },
+                # 4. Duplicate absent reference → AMBIGUOUS edge, but placeholder
+                #    must be deduplicated with #3.
+                {
+                    "target_name": "missing-cm",
+                    "target_kind": "ConfigMap",
+                    "namespace": "payments",
+                    "relation": "references",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "sidecar",
+                },
+            ],
+        }
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references(per_file, all_nodes, all_edges)
+
+    # --- Edges: 1 EXTRACTED + 3 AMBIGUOUS ---
+    assert len(all_edges) == 4
+
+    extracted = [e for e in all_edges if e.get("confidence") == "EXTRACTED"]
+    ambiguous = [e for e in all_edges if e.get("confidence") == "AMBIGUOUS"]
+    assert len(extracted) == 1
+    assert len(ambiguous) == 3
+
+    # EXTRACTED edge for same-ns-cm (target is the real node id).
+    assert extracted[0] == {
+        "source": "k8s://payments/Deployment/api-server",
+        "target": "k8s://payments/ConfigMap/same-ns-cm",
+        "relation": "references",
+        "confidence": "EXTRACTED",
+        "source_file": "dep.yaml",
+    }
+
+    # AMBIGUOUS edges: two for missing-cm (deduped placeholder), one for envfrom-cm.
+    wrong_ns_edge = next(
+        e for e in ambiguous
+        if e["target"] == "k8s://payments/ConfigMap/envfrom-cm#unresolved"
+    )
+    assert wrong_ns_edge == {
+        "source": "k8s://payments/Deployment/api-server",
+        "target": "k8s://payments/ConfigMap/envfrom-cm#unresolved",
+        "relation": "references",
+        "confidence": "AMBIGUOUS",
+        "source_file": "dep.yaml",
+    }
+
+    missing_edges = [e for e in ambiguous if e["target"] == "k8s://payments/ConfigMap/missing-cm#unresolved"]
+    assert len(missing_edges) == 2
+    assert missing_edges[0] == {
+        "source": "k8s://payments/Deployment/api-server",
+        "target": "k8s://payments/ConfigMap/missing-cm#unresolved",
+        "relation": "references",
+        "confidence": "AMBIGUOUS",
+        "source_file": "dep.yaml",
+    }
+    assert missing_edges[1] == {
+        "source": "k8s://payments/Deployment/sidecar",
+        "target": "k8s://payments/ConfigMap/missing-cm#unresolved",
+        "relation": "references",
+        "confidence": "AMBIGUOUS",
+        "source_file": "dep.yaml",
+    }
+
+    # --- Placeholder nodes ---
+    placeholders = [n for n in all_nodes if n.get("id", "").endswith("#unresolved")]
+    assert len(placeholders) == 2, "Only two unique unresolved targets, so two placeholders"
+
+    envfrom_ph = next(
+        n for n in placeholders
+        if n["id"] == "k8s://payments/ConfigMap/envfrom-cm#unresolved"
+    )
+    assert envfrom_ph == {
+        "id": "k8s://payments/ConfigMap/envfrom-cm#unresolved",
+        "label": "ConfigMap/envfrom-cm (unresolved)",
+        "file_type": "k8s",
+        "source_file": "dep.yaml",
+        "attributes": {"unresolved": True},
+    }
+
+    missing_ph = next(
+        n for n in placeholders
+        if n["id"] == "k8s://payments/ConfigMap/missing-cm#unresolved"
+    )
+    assert missing_ph == {
+        "id": "k8s://payments/ConfigMap/missing-cm#unresolved",
+        "label": "ConfigMap/missing-cm (unresolved)",
+        "file_type": "k8s",
+        "source_file": "dep.yaml",
+        "attributes": {"unresolved": True},
+    }
+
