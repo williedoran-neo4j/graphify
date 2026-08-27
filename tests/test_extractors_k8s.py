@@ -308,6 +308,35 @@ def test_k8s_file_type_passes_validation_and_survives_build():
     assert G.nodes["k8s://x/K/y"]["file_type"] == "k8s"
 
 
+def test_argo_file_type_passes_validation_and_survives_build():
+    """A node with file_type="argo" must pass schema validation without a file_type
+    error and must retain file_type="argo" through graph assembly, not be coerced
+    to "concept"."""
+    from graphify.validate import validate_extraction
+    from graphify.build import build_from_json
+
+    extraction = {
+        "nodes": [
+            {
+                "id": "argo://x/WorkflowTemplate/n",
+                "label": "WorkflowTemplate/n",
+                "file_type": "argo",
+                "source_file": "f.yaml",
+            }
+        ],
+        "edges": [],
+    }
+
+    # Validation: must NOT flag "argo" as an invalid file_type
+    errors = validate_extraction(extraction)
+    file_type_errors = [e for e in errors if "file_type" in e or "'argo'" in e]
+    assert file_type_errors == []
+
+    # Build: file_type must survive as "argo", not be coerced to "concept"
+    G = build_from_json(extraction)
+    assert G.nodes["argo://x/WorkflowTemplate/n"]["file_type"] == "argo"
+
+
 def test_extract_k8s_collects_candidates_for_references_and_service_account():
     """extract_k8s returns a k8s_candidates list with one bare dict per
     reference (envFrom, env.valueFrom, volumes) and per serviceAccountName.
