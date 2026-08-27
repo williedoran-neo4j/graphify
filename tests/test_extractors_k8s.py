@@ -106,6 +106,54 @@ kind: MissingApiVersion
     assert detect_dialect(p, mixed) is None
 
 
+def test_detect_dialect_classifies_argo_workflow_manifests_and_rejects_mixed_and_non_workflow_kinds():
+    """detect_dialect returns ARGO_WORKFLOW only when every YAML document has an
+    apiVersion starting with argoproj.io/ and a kind in the workflow set.
+    Mixed files, non-workflow Argo kinds, and plain K8s manifests return None."""
+    p = Path("/dev/null")
+
+    # Single WorkflowTemplate — valid Argo workflow.
+    workflow_template = """\
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: my-template
+"""
+    assert detect_dialect(p, workflow_template) is Dialect.ARGO_WORKFLOW
+
+    # Single CronWorkflow — valid Argo workflow.
+    cron_workflow = """\
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: my-cron
+"""
+    assert detect_dialect(p, cron_workflow) is Dialect.ARGO_WORKFLOW
+
+    # Mixed multi-doc: one Argo Workflow + one plain K8s ConfigMap.
+    mixed_argo_k8s = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: my-flow
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+"""
+    assert detect_dialect(p, mixed_argo_k8s) is None
+
+    # Argo CD Application — NOT a workflow kind, must stay None.
+    argo_app = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+"""
+    assert detect_dialect(p, argo_app) is None
+
+
 def test_extract_k8s_emits_raw_id_nodes_with_attributes_and_ignores_non_k8s():
     """extract_k8s emits one node per k8s manifest doc with raw k8s:// ids,
     labels, file_type, source metadata, and attributes including containers.

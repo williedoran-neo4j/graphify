@@ -9,6 +9,7 @@ import yaml
 
 class Dialect(Enum):
     K8S_MANIFEST = auto()
+    ARGO_WORKFLOW = auto()
 
 
 def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
@@ -19,6 +20,14 @@ def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
         return None
     if not docs:
         return None
+    argo_kinds = {
+        "Workflow",
+        "WorkflowTemplate",
+        "ClusterWorkflowTemplate",
+        "CronWorkflow",
+    }
+    saw_argo = False
+    all_argo = True
     for doc in docs:
         if not isinstance(doc, dict):
             return None
@@ -27,7 +36,15 @@ def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
         if not isinstance(api_version, str) or not isinstance(kind, str):
             return None
         if api_version.startswith("argoproj.io/"):
-            return None
+            if kind not in argo_kinds:
+                return None
+            saw_argo = True
+        else:
+            all_argo = False
+    if all_argo:
+        return Dialect.ARGO_WORKFLOW
+    if saw_argo:
+        return None
     return Dialect.K8S_MANIFEST
 
 
