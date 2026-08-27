@@ -164,7 +164,8 @@ def _resolve_k8s_references(
     placeholder_ids = set()
     for entry in per_file:
         for candidate in entry.get("k8s_candidates") or []:
-            if candidate.get("relation") != "references":
+            relation = candidate.get("relation")
+            if relation not in ("references", "uses_service_account"):
                 continue
             target = index.get(
                 (
@@ -185,7 +186,7 @@ def _resolve_k8s_references(
                             f"{candidate['source_kind']}/{candidate['source_name']}"
                         ),
                         "target": unresolved_id,
-                        "relation": "references",
+                        "relation": relation,
                         "confidence": "AMBIGUOUS",
                         "source_file": candidate["source_file"],
                     }
@@ -212,7 +213,7 @@ def _resolve_k8s_references(
                         f"{candidate['source_kind']}/{candidate['source_name']}"
                     ),
                     "target": target,
-                    "relation": "references",
+                    "relation": relation,
                     "confidence": "EXTRACTED",
                     "source_file": candidate["source_file"],
                 }

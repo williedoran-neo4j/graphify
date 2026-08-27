@@ -718,3 +718,100 @@ def test_resolve_k8s_references_emits_ambiguous_edges_and_placeholder_nodes_for_
         "attributes": {"unresolved": True},
     }
 
+
+def test_resolve_k8s_references_emits_uses_service_account_edges_extracted_and_ambiguous():
+    """uses_service_account candidates resolve through the same EXTRACTED/AMBIGUOUS
+    path as references: a same-namespace ServiceAccount yields an EXTRACTED edge,
+    an absent one yields an AMBIGUOUS edge plus a deduped placeholder node, and no
+    candidate is silently dropped."""
+    all_nodes = [
+        {
+            "id": "k8s://payments/Deployment/api-server",
+            "label": "Deployment/api-server",
+            "file_type": "k8s",
+            "source_file": "dep.yaml",
+            "attributes": {"kind": "Deployment", "namespace": "payments"},
+        },
+        {
+            "id": "k8s://payments/ServiceAccount/my-sa",
+            "label": "ServiceAccount/my-sa",
+            "file_type": "k8s",
+            "source_file": "sa.yaml",
+            "attributes": {"kind": "ServiceAccount", "namespace": "payments"},
+        },
+        {
+            "id": "k8s://jobs/Pod/worker",
+            "label": "Pod/worker",
+            "file_type": "k8s",
+            "source_file": "pod.yaml",
+            "attributes": {"kind": "Pod", "namespace": "jobs"},
+        },
+    ]
+
+    per_file = [
+        {
+            "nodes": [],
+            "edges": [],
+            "k8s_candidates": [
+                # EXTRACTED — same-namespace ServiceAccount exists.
+                {
+                    "target_name": "my-sa",
+                    "target_kind": "ServiceAccount",
+                    "namespace": "payments",
+                    "relation": "uses_service_account",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "api-server",
+                },
+                # AMBIGUOUS — ServiceAccount absent in jobs namespace.
+                {
+                    "target_name": "pod-sa",
+                    "target_kind": "ServiceAccount",
+                    "namespace": "jobs",
+                    "relation": "uses_service_account",
+                    "source_file": "pod.yaml",
+                    "source_kind": "Pod",
+                    "source_name": "worker",
+                },
+            ],
+        }
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references(per_file, all_nodes, all_edges)
+
+    # Exactly one edge per candidate — no silent drop.
+    assert len(all_edges) == 2
+
+    extracted = [e for e in all_edges if e.get("confidence") == "EXTRACTED"]
+    ambiguous = [e for e in all_edges if e.get("confidence") == "AMBIGUOUS"]
+    assert len(extracted) == 1
+    assert len(ambiguous) == 1
+
+    assert extracted[0] == {
+        "source": "k8s://payments/Deployment/api-server",
+        "target": "k8s://payments/ServiceAccount/my-sa",
+        "relation": "uses_service_account",
+        "confidence": "EXTRACTED",
+        "source_file": "dep.yaml",
+    }
+
+    assert ambiguous[0] == {
+        "source": "k8s://jobs/Pod/worker",
+        "target": "k8s://jobs/ServiceAccount/pod-sa#unresolved",
+        "relation": "uses_service_account",
+        "confidence": "AMBIGUOUS",
+        "source_file": "pod.yaml",
+    }
+
+    # Placeholder node for the unresolved ServiceAccount.
+    placeholders = [n for n in all_nodes if n.get("id", "").endswith("#unresolved")]
+    assert len(placeholders) == 1
+    assert placeholders[0] == {
+        "id": "k8s://jobs/ServiceAccount/pod-sa#unresolved",
+        "label": "ServiceAccount/pod-sa (unresolved)",
+        "file_type": "k8s",
+        "source_file": "pod.yaml",
+        "attributes": {"unresolved": True},
+    }
+
