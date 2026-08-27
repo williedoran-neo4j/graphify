@@ -1074,3 +1074,86 @@ def test_resolve_k8s_references_emits_selects_edge_for_subset_selector_match():
     assert "k8s://payments/Deployment/other" not in targets
     assert "k8s://other/Deployment/api" not in targets
 
+
+def test_extract_k8s_emits_argo_workflow_and_template_nodes_for_workflow_template():
+    """An Argo WorkflowTemplate with entrypoint and templates emits a workflow-level
+    node with argo:// id and file_type='argo', plus one template node per
+    spec.templates[] entry with container_image only when a container or script
+    image is present."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        wftmpl = td_path / "hello-artifacts-wftmpl.yaml"
+        wftmpl.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: hello-artifacts
+  namespace: kg-builder
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: produce
+            template: produce
+    - name: produce
+      container:
+        image: alpine:3.20
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(wftmpl)
+
+        # Edges are C3/C4, not this change.
+        assert result["edges"] == []
+
+        nodes = result["nodes"]
+        assert len(nodes) == 3, f"Expected 3 nodes (1 workflow + 2 templates), got {len(nodes)}"
+
+        # Workflow-level node
+        workflow_node = next(
+            (n for n in nodes if n["id"] == "argo://kg-builder/WorkflowTemplate/hello-artifacts"),
+            None,
+        )
+        assert workflow_node is not None
+        assert workflow_node["label"] == "WorkflowTemplate/hello-artifacts"
+        assert workflow_node["file_type"] == "argo"
+        assert workflow_node["source_file"] == str(wftmpl)
+        assert workflow_node["source_location"] == "doc0"
+        assert workflow_node["attributes"]["kind"] == "WorkflowTemplate"
+        assert workflow_node["attributes"]["namespace"] == "kg-builder"
+        assert workflow_node["attributes"]["entrypoint"] == "main"
+
+        # Template node: main (dag template, no container_image)
+        main_template = next(
+            (n for n in nodes if n["id"] == "argo://kg-builder/WorkflowTemplate/hello-artifacts/main"),
+            None,
+        )
+        assert main_template is not None
+        assert main_template["label"] == "main"
+        assert main_template["file_type"] == "argo"
+        assert main_template["source_file"] == str(wftmpl)
+        assert main_template["source_location"] == "doc0"
+        assert main_template["attributes"]["template"] == "main"
+        assert main_template["attributes"]["parent"] == "hello-artifacts"
+        assert "container_image" not in main_template["attributes"]
+
+        # Template node: produce (has container image)
+        produce_template = next(
+            (n for n in nodes if n["id"] == "argo://kg-builder/WorkflowTemplate/hello-artifacts/produce"),
+            None,
+        )
+        assert produce_template is not None
+        assert produce_template["label"] == "produce"
+        assert produce_template["file_type"] == "argo"
+        assert produce_template["source_file"] == str(wftmpl)
+        assert produce_template["source_location"] == "doc0"
+        assert produce_template["attributes"]["template"] == "produce"
+        assert produce_template["attributes"]["parent"] == "hello-artifacts"
+        assert produce_template["attributes"]["container_image"] == "alpine:3.20"
+

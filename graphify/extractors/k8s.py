@@ -57,7 +57,10 @@ def extract_k8s(path: Path) -> dict:
     Non-k8s YAML yields no nodes and no candidates.
     """
     raw_text = path.read_text(encoding="utf-8", errors="replace")
-    if detect_dialect(path, raw_text) is not Dialect.K8S_MANIFEST:
+    dialect = detect_dialect(path, raw_text)
+    if dialect is Dialect.ARGO_WORKFLOW:
+        return _extract_argo(path, raw_text)
+    if dialect is not Dialect.K8S_MANIFEST:
         return {"nodes": [], "edges": [], "k8s_candidates": []}
     nodes = []
     candidates = []
@@ -180,6 +183,65 @@ def _candidates(doc: dict, base: dict) -> list[dict]:
             }
         )
     return out
+
+
+def _extract_argo(path: Path, raw_text: str) -> dict:
+    """Extract Argo workflow and template nodes from a YAML file."""
+    nodes = []
+    for i, doc in enumerate(yaml.safe_load_all(raw_text)):
+        if not isinstance(doc, dict):
+            continue
+        metadata = doc.get("metadata") or {}
+        kind = doc.get("kind", "")
+        name = metadata.get("name", "")
+        namespace = metadata.get("namespace") or "_cluster"
+        source = {
+            "source_file": str(path),
+            "source_location": f"doc{i}",
+        }
+        workflow_attrs = {"kind": kind, "namespace": namespace}
+        spec = doc.get("spec")
+        if isinstance(spec, dict):
+            entrypoint = spec.get("entrypoint")
+            if isinstance(entrypoint, str) and entrypoint:
+                workflow_attrs["entrypoint"] = entrypoint
+        nodes.append(
+            {
+                "id": f"argo://{namespace}/{kind}/{name}",
+                "label": f"{kind}/{name}",
+                "file_type": "argo",
+                **source,
+                "attributes": workflow_attrs,
+            }
+        )
+        templates = spec.get("templates") if isinstance(spec, dict) else None
+        if isinstance(templates, list):
+            for t in templates:
+                if not isinstance(t, dict):
+                    continue
+                template = t.get("name")
+                if not isinstance(template, str) or not template:
+                    continue
+                template_attrs = {"template": template, "parent": name}
+                container_image = None
+                container = t.get("container")
+                if isinstance(container, dict):
+                    container_image = container.get("image")
+                script = t.get("script")
+                if isinstance(script, dict) and isinstance(script.get("image"), str):
+                    container_image = script.get("image")
+                if isinstance(container_image, str) and container_image:
+                    template_attrs["container_image"] = container_image
+                nodes.append(
+                    {
+                        "id": f"argo://{namespace}/{kind}/{name}/{template}",
+                        "label": template,
+                        "file_type": "argo",
+                        **source,
+                        "attributes": template_attrs,
+                    }
+                )
+    return {"nodes": nodes, "edges": [], "k8s_candidates": []}
 
 
 def _resolve_k8s_references(
