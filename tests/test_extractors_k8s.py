@@ -223,3 +223,32 @@ jobs:
         }
         assert "containers" not in cu["attributes"]
         assert result_custom["edges"] == []
+
+
+def test_k8s_file_type_passes_validation_and_survives_build():
+    """A node with file_type="k8s" must pass schema validation without a file_type
+    error and must retain file_type="k8s" through graph assembly, not be coerced
+    to "concept"."""
+    from graphify.validate import validate_extraction
+    from graphify.build import build_from_json
+
+    extraction = {
+        "nodes": [
+            {
+                "id": "k8s://x/K/y",
+                "label": "K/y",
+                "file_type": "k8s",
+                "source_file": "f.yaml",
+            }
+        ],
+        "edges": [],
+    }
+
+    # Validation: must NOT flag "k8s" as an invalid file_type
+    errors = validate_extraction(extraction)
+    file_type_errors = [e for e in errors if "file_type" in e or "'k8s'" in e]
+    assert file_type_errors == []
+
+    # Build: file_type must survive as "k8s", not be coerced to "concept"
+    G = build_from_json(extraction)
+    assert G.nodes["k8s://x/K/y"]["file_type"] == "k8s"
