@@ -1420,3 +1420,42 @@ spec:
             f"Expected 2 invokes edges, got {len(invokes_edges)}: {invokes_edges}"
         )
 
+
+def test_extract_argo_collects_workflow_template_ref_from_spec_directly_for_workflow():
+    """A canonical Workflow manifest (not CronWorkflow) places workflowTemplateRef
+    directly under spec, not under spec.workflowSpec. The extractor must fall back
+    to reading from spec when workflowSpec is absent and still emit an argo_candidate
+    with the correct source, namespace, and target kind."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        wf = td_path / "workflow.yaml"
+        wf.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: my-wf
+  namespace: jobs
+spec:
+  workflowTemplateRef:
+    name: some-template
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(wf)
+
+        assert "argo_candidates" in result
+        cands = result["argo_candidates"]
+        assert len(cands) == 1
+        assert cands[0] == {
+            "source": "argo://jobs/Workflow/my-wf",
+            "target_name": "some-template",
+            "target_kind": "WorkflowTemplate",
+            "namespace": "jobs",
+            "source_file": str(wf),
+            "relation": "references",
+        }
+
