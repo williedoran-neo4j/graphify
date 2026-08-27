@@ -239,6 +239,40 @@ def _resolve_k8s_references(
                     "source_file": candidate["source_file"],
                 }
             )
+    # Selector->labels pass: a Service whose selector is a subset of a
+    # same-namespace workload's labels selects that workload.
+    services = []
+    workloads = []
+    for node in all_nodes:
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or not node_id.startswith("k8s://"):
+            continue
+        attributes = node.get("attributes") or {}
+        kind = attributes.get("kind")
+        if kind == "Service" and attributes.get("selector"):
+            services.append(node)
+        elif kind != "Service" and attributes.get("labels"):
+            workloads.append(node)
+    for svc in services:
+        svc_id = svc["id"]
+        svc_ns = svc_id[len("k8s://"):].split("/", 2)[0]
+        selector = (svc.get("attributes") or {}).get("selector") or {}
+        for workload in workloads:
+            workload_id = workload["id"]
+            workload_ns = workload_id[len("k8s://"):].split("/", 2)[0]
+            if workload_ns != svc_ns:
+                continue
+            labels = (workload.get("attributes") or {}).get("labels") or {}
+            if all(labels.get(k) == v for k, v in selector.items()):
+                all_edges.append(
+                    {
+                        "source": svc_id,
+                        "target": workload_id,
+                        "relation": "selects",
+                        "confidence": "INFERRED",
+                        "source_file": svc["source_file"],
+                    }
+                )
 
 
 def _container_names(doc: dict) -> list[str]:

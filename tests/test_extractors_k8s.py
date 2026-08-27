@@ -954,3 +954,75 @@ metadata:
         assert "selector" not in svc_no_node["attributes"]
         assert "labels" not in svc_no_node["attributes"]
 
+
+def test_resolve_k8s_references_emits_selects_edge_for_subset_selector_match():
+    """Services whose selector is a subset of a workload's labels in the same
+    namespace emit a single selects edge with INFERRED confidence. No edge is
+    emitted when the selector is not a subset or the namespaces differ."""
+    svc_source_file = "svc.yaml"
+    all_nodes = [
+        {
+            "id": "k8s://payments/Service/svc",
+            "label": "Service/svc",
+            "file_type": "k8s",
+            "source_file": svc_source_file,
+            "attributes": {
+                "kind": "Service",
+                "namespace": "payments",
+                "selector": {"app": "api", "tier": "frontend"},
+            },
+        },
+        {
+            "id": "k8s://payments/Deployment/api",
+            "label": "Deployment/api",
+            "file_type": "k8s",
+            "source_file": "dep.yaml",
+            "attributes": {
+                "kind": "Deployment",
+                "namespace": "payments",
+                "labels": {"app": "api", "tier": "frontend", "env": "prod"},
+            },
+        },
+        {
+            "id": "k8s://payments/Deployment/other",
+            "label": "Deployment/other",
+            "file_type": "k8s",
+            "source_file": "other.yaml",
+            "attributes": {
+                "kind": "Deployment",
+                "namespace": "payments",
+                "labels": {"app": "other", "tier": "frontend"},
+            },
+        },
+        {
+            "id": "k8s://other/Deployment/api",
+            "label": "Deployment/api",
+            "file_type": "k8s",
+            "source_file": "other_dep.yaml",
+            "attributes": {
+                "kind": "Deployment",
+                "namespace": "other",
+                "labels": {"app": "api", "tier": "frontend", "env": "prod"},
+            },
+        },
+    ]
+
+    per_file = []
+    all_edges: list[dict] = []
+    _resolve_k8s_references(per_file, all_nodes, all_edges)
+
+    selects_edges = [e for e in all_edges if e.get("relation") == "selects"]
+    assert len(selects_edges) == 1, f"Expected exactly 1 selects edge, got {len(selects_edges)}"
+
+    edge = selects_edges[0]
+    assert edge["source"] == "k8s://payments/Service/svc"
+    assert edge["target"] == "k8s://payments/Deployment/api"
+    assert edge["relation"] == "selects"
+    assert edge["confidence"] == "INFERRED"
+    assert edge["source_file"] == svc_source_file
+
+    # Ensure no edges were emitted to the non-matching or cross-namespace workloads.
+    targets = {e["target"] for e in all_edges}
+    assert "k8s://payments/Deployment/other" not in targets
+    assert "k8s://other/Deployment/api" not in targets
+
