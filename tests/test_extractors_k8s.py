@@ -252,3 +252,21 @@ def test_k8s_file_type_passes_validation_and_survives_build():
     # Build: file_type must survive as "k8s", not be coerced to "concept"
     G = build_from_json(extraction)
     assert G.nodes["k8s://x/K/y"]["file_type"] == "k8s"
+
+
+def test_yaml_is_code_and_dispatched_to_extract_k8s():
+    """.yaml and .yml must be classified as code (not documents) and routed to
+    extract_k8s by _get_extractor."""
+    from graphify.detect import CODE_EXTENSIONS, DOC_EXTENSIONS
+    from graphify.extract import _get_extractor
+
+    # Reclassification boundary: YAML is code, not a document.
+    assert ".yaml" in CODE_EXTENSIONS
+    assert ".yml" in CODE_EXTENSIONS
+    assert ".yaml" not in DOC_EXTENSIONS
+    assert ".yml" not in DOC_EXTENSIONS
+
+    # Dispatch boundary: _get_extractor must route to extract_k8s.
+    assert _get_extractor(Path("deploy.yaml")) is extract_k8s
+    assert _get_extractor(Path("setup.yml")) is extract_k8s
+
