@@ -186,8 +186,9 @@ def _candidates(doc: dict, base: dict) -> list[dict]:
 
 
 def _extract_argo(path: Path, raw_text: str) -> dict:
-    """Extract Argo workflow and template nodes from a YAML file."""
+    """Extract Argo workflow, template nodes, and within-doc invokes edges."""
     nodes = []
+    edges = []
     for i, doc in enumerate(yaml.safe_load_all(raw_text)):
         if not isinstance(doc, dict):
             continue
@@ -241,7 +242,102 @@ def _extract_argo(path: Path, raw_text: str) -> dict:
                         "attributes": template_attrs,
                     }
                 )
-    return {"nodes": nodes, "edges": [], "k8s_candidates": []}
+        if isinstance(templates, list):
+            _emit_argo_invokes(
+                templates,
+                namespace,
+                kind,
+                name,
+                source,
+                nodes,
+                edges,
+            )
+    return {"nodes": nodes, "edges": edges, "k8s_candidates": []}
+
+
+def _emit_argo_invokes(
+    templates: list,
+    namespace: str,
+    kind: str,
+    name: str,
+    source: dict,
+    nodes: list[dict],
+    edges: list[dict],
+) -> None:
+    """Emit invokes edges for dag tasks and steps nested in execution templates.
+
+    Confidences are EXTRACTED when a template ref resolves to a same-doc
+    spec.templates[] entry name, and AMBIGUOUS otherwise (a deduplicated
+    placeholder node is appended for each unresolved ref).
+    """
+    template_ids = {
+        t["name"]: f"argo://{namespace}/{kind}/{name}/{t['name']}"
+        for t in templates
+        if isinstance(t, dict) and isinstance(t.get("name"), str)
+    }
+    placeholders = set()
+
+    def _edge(ref: str, container_id: str) -> None:
+        target = template_ids.get(ref)
+        if target is not None:
+            edges.append(
+                {
+                    "source": container_id,
+                    "target": target,
+                    "relation": "invokes",
+                    "confidence": "EXTRACTED",
+                    "source_file": source["source_file"],
+                }
+            )
+            return
+        unresolved_id = f"argo://{namespace}/{kind}/{name}/{ref}#unresolved"
+        edges.append(
+            {
+                "source": container_id,
+                "target": unresolved_id,
+                "relation": "invokes",
+                "confidence": "AMBIGUOUS",
+                "source_file": source["source_file"],
+            }
+        )
+        if unresolved_id not in placeholders:
+            placeholders.add(unresolved_id)
+            nodes.append(
+                {
+                    "id": unresolved_id,
+                    "label": f"{ref} (unresolved)",
+                    "file_type": "argo",
+                    "source_file": source["source_file"],
+                    "attributes": {"unresolved": True},
+                }
+            )
+
+    for t in templates:
+        if not isinstance(t, dict):
+            continue
+        container_name = t.get("name")
+        if not isinstance(container_name, str) or not container_name:
+            continue
+        container_id = f"argo://{namespace}/{kind}/{name}/{container_name}"
+        dag = t.get("dag")
+        if isinstance(dag, dict):
+            tasks = dag.get("tasks")
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if isinstance(task, dict):
+                        ref = task.get("template")
+                        if isinstance(ref, str) and ref:
+                            _edge(ref, container_id)
+        steps = t.get("steps")
+        if isinstance(steps, list):
+            for group in steps:
+                if not isinstance(group, list):
+                    continue
+                for step in group:
+                    if isinstance(step, dict):
+                        ref = step.get("template")
+                        if isinstance(ref, str) and ref:
+                            _edge(ref, container_id)
 
 
 def _resolve_k8s_references(

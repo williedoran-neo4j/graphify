@@ -1109,8 +1109,6 @@ spec:
 
         result = extract_k8s(wftmpl)
 
-        # Edges are C3/C4, not this change.
-        assert result["edges"] == []
 
         nodes = result["nodes"]
         assert len(nodes) == 3, f"Expected 3 nodes (1 workflow + 2 templates), got {len(nodes)}"
@@ -1156,4 +1154,100 @@ spec:
         assert produce_template["attributes"]["template"] == "produce"
         assert produce_template["attributes"]["parent"] == "hello-artifacts"
         assert produce_template["attributes"]["container_image"] == "alpine:3.20"
+
+
+def test_extract_argo_emits_invokes_edges_for_dag_tasks_and_steps():
+    """Argo execution templates (dag and steps) emit invokes edges from the
+    containing template node to each referenced template node. Resolved refs
+    produce EXTRACTED confidence; unresolved refs produce AMBIGUOUS edges
+    pointing at a deduplicated placeholder node."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        wftmpl = td_path / "invokes-test.yaml"
+        wftmpl.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: test
+spec:
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: produce-task
+            template: produce
+          - name: consume-task
+            template: consume
+          - name: missing-task
+            template: missing
+    - name: produce
+      container:
+        image: alpine:3.20
+    - name: consume
+      steps:
+        - - name: c1
+            template: produce
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(wftmpl)
+
+        edges = result["edges"]
+        nodes = result["nodes"]
+
+        assert len(edges) == 4, f"Expected 4 edges, got {len(edges)}: {edges}"
+
+        main_id = "argo://_cluster/WorkflowTemplate/test/main"
+        produce_id = "argo://_cluster/WorkflowTemplate/test/produce"
+        consume_id = "argo://_cluster/WorkflowTemplate/test/consume"
+        missing_id = "argo://_cluster/WorkflowTemplate/test/missing#unresolved"
+
+        expected = [
+            {
+                "source": main_id,
+                "target": produce_id,
+                "relation": "invokes",
+                "confidence": "EXTRACTED",
+                "source_file": str(wftmpl),
+            },
+            {
+                "source": main_id,
+                "target": consume_id,
+                "relation": "invokes",
+                "confidence": "EXTRACTED",
+                "source_file": str(wftmpl),
+            },
+            {
+                "source": consume_id,
+                "target": produce_id,
+                "relation": "invokes",
+                "confidence": "EXTRACTED",
+                "source_file": str(wftmpl),
+            },
+            {
+                "source": main_id,
+                "target": missing_id,
+                "relation": "invokes",
+                "confidence": "AMBIGUOUS",
+                "source_file": str(wftmpl),
+            },
+        ]
+
+        for exp in expected:
+            assert any(e == exp for e in edges), f"Missing expected edge {exp!r}"
+
+        # Placeholder node for unresolved template
+        ph_nodes = [n for n in nodes if n["id"] == missing_id]
+        assert len(ph_nodes) == 1
+        assert ph_nodes[0] == {
+            "id": missing_id,
+            "label": "missing (unresolved)",
+            "file_type": "argo",
+            "source_file": str(wftmpl),
+            "attributes": {"unresolved": True},
+        }
 
