@@ -174,7 +174,8 @@ jobs:
         result_non = extract_k8s(non_k8s)
 
         # Non-k8s must return empty.
-        assert result_non == {"nodes": [], "edges": []}
+        assert result_non["nodes"] == []
+        assert result_non["edges"] == []
 
         # Deployment assertions.
         dep_nodes = result_dep["nodes"]
@@ -252,6 +253,203 @@ def test_k8s_file_type_passes_validation_and_survives_build():
     # Build: file_type must survive as "k8s", not be coerced to "concept"
     G = build_from_json(extraction)
     assert G.nodes["k8s://x/K/y"]["file_type"] == "k8s"
+
+
+def test_extract_k8s_collects_candidates_for_references_and_service_account():
+    """extract_k8s returns a k8s_candidates list with one bare dict per
+    reference (envFrom, env.valueFrom, volumes) and per serviceAccountName.
+    Each candidate carries target_name, target_kind, namespace, relation,
+    source_file, source_kind, and source_name — no edge-shaped keys."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+
+        # Deployment with every reference source and a serviceAccountName.
+        deployment = td_path / "deployment.yaml"
+        deployment.write_text(
+            """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      serviceAccountName: my-sa
+      containers:
+        - name: app
+          envFrom:
+            - configMapRef:
+                name: envfrom-cm
+            - secretRef:
+                name: envfrom-sec
+          env:
+            - name: KEY1
+              valueFrom:
+                configMapKeyRef:
+                  name: env-cm-key
+                  key: k1
+            - name: KEY2
+              valueFrom:
+                secretKeyRef:
+                  name: env-sec-key
+                  key: k2
+          volumeMounts:
+            - name: vol-cm
+              mountPath: /etc/cm
+            - name: vol-sec
+              mountPath: /etc/secret
+      volumes:
+        - name: vol-cm
+          configMap:
+            name: vol-cm-name
+        - name: vol-sec
+          secret:
+            secretName: vol-sec-name
+""",
+            encoding="utf-8",
+        )
+
+        # Pod with direct serviceAccountName (not under template).
+        pod = td_path / "pod.yaml"
+        pod.write_text(
+            """\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker
+  namespace: jobs
+spec:
+  serviceAccountName: pod-sa
+  containers:
+    - name: main
+""",
+            encoding="utf-8",
+        )
+
+        # K8s manifest with no references at all.
+        bare = td_path / "bare.yaml"
+        bare.write_text(
+            """\
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: plain-cm
+  namespace: default
+""",
+            encoding="utf-8",
+        )
+
+        result_dep = extract_k8s(deployment)
+        result_pod = extract_k8s(pod)
+        result_bare = extract_k8s(bare)
+
+        # edges must stay empty (candidates are not edges yet).
+        assert result_dep["edges"] == []
+        assert result_pod["edges"] == []
+        assert result_bare["edges"] == []
+
+        # --- Deployment candidates ---
+        cands = result_dep["k8s_candidates"]
+        assert len(cands) == 7
+
+        expected_dep = [
+            {
+                "target_name": "envfrom-cm",
+                "target_kind": "ConfigMap",
+                "namespace": "payments",
+                "relation": "references",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+            {
+                "target_name": "envfrom-sec",
+                "target_kind": "Secret",
+                "namespace": "payments",
+                "relation": "references",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+            {
+                "target_name": "env-cm-key",
+                "target_kind": "ConfigMap",
+                "namespace": "payments",
+                "relation": "references",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+            {
+                "target_name": "env-sec-key",
+                "target_kind": "Secret",
+                "namespace": "payments",
+                "relation": "references",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+            {
+                "target_name": "vol-cm-name",
+                "target_kind": "ConfigMap",
+                "namespace": "payments",
+                "relation": "references",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+            {
+                "target_name": "vol-sec-name",
+                "target_kind": "Secret",
+                "namespace": "payments",
+                "relation": "references",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+            {
+                "target_name": "my-sa",
+                "target_kind": "ServiceAccount",
+                "namespace": "payments",
+                "relation": "uses_service_account",
+                "source_file": str(deployment),
+                "source_kind": "Deployment",
+                "source_name": "api-server",
+            },
+        ]
+        for exp in expected_dep:
+            assert any(c == exp for c in cands), f"Missing candidate {exp!r}"
+
+        # Every candidate must have exactly the allowed keys (no edge-shaped keys).
+        for c in cands:
+            assert set(c.keys()) == {
+                "target_name",
+                "target_kind",
+                "namespace",
+                "relation",
+                "source_file",
+                "source_kind",
+                "source_name",
+            }
+
+        # --- Pod candidates ---
+        pod_cands = result_pod["k8s_candidates"]
+        assert len(pod_cands) == 1
+        assert pod_cands[0] == {
+            "target_name": "pod-sa",
+            "target_kind": "ServiceAccount",
+            "namespace": "jobs",
+            "relation": "uses_service_account",
+            "source_file": str(pod),
+            "source_kind": "Pod",
+            "source_name": "worker",
+        }
+
+        # --- Bare manifest (no references) ---
+        assert result_bare["k8s_candidates"] == []
 
 
 def test_yaml_is_code_and_dispatched_to_extract_k8s():
