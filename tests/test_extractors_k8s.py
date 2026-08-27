@@ -1281,6 +1281,83 @@ spec:
         }
 
 
+def test_extract_argo_collects_workflow_template_ref_candidates():
+    """Argo CronWorkflow and Workflow manifests with spec.workflowSpec.workflowTemplateRef
+    or clusterWorkflowTemplateRef emit argo_candidates side-channel entries carrying the
+    referencing workflow node id as source, target kind, namespace, and source_file.
+    No references edge is emitted at pass 1."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+
+        # CronWorkflow with namespaced workflowTemplateRef
+        cron = td_path / "cron.yaml"
+        cron.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: hourly-etl
+  namespace: payments
+spec:
+  workflowSpec:
+    workflowTemplateRef:
+      name: daily-env-cost-ingestion
+""",
+            encoding="utf-8",
+        )
+
+        # Workflow with clusterWorkflowTemplateRef (no metadata.namespace → _cluster)
+        cluster = td_path / "cluster.yaml"
+        cluster.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: cluster-pipeline
+spec:
+  workflowSpec:
+    clusterWorkflowTemplateRef:
+      name: shared-data-template
+""",
+            encoding="utf-8",
+        )
+
+        result_cron = extract_k8s(cron)
+        result_cluster = extract_k8s(cluster)
+
+        # --- CronWorkflow: namespaced workflowTemplateRef ---
+        assert "argo_candidates" in result_cron
+        cands_cron = result_cron["argo_candidates"]
+        assert len(cands_cron) == 1
+        assert cands_cron[0] == {
+            "source": "argo://payments/CronWorkflow/hourly-etl",
+            "target_name": "daily-env-cost-ingestion",
+            "target_kind": "WorkflowTemplate",
+            "namespace": "payments",
+            "source_file": str(cron),
+            "relation": "references",
+        }
+
+        # --- Workflow: clusterWorkflowTemplateRef ---
+        assert "argo_candidates" in result_cluster
+        cands_cluster = result_cluster["argo_candidates"]
+        assert len(cands_cluster) == 1
+        assert cands_cluster[0] == {
+            "source": "argo://_cluster/Workflow/cluster-pipeline",
+            "target_name": "shared-data-template",
+            "target_kind": "ClusterWorkflowTemplate",
+            "namespace": "_cluster",
+            "source_file": str(cluster),
+            "relation": "references",
+        }
+
+        # No references edges emitted at pass 1 (edges stay within-doc only).
+        assert all(e.get("relation") != "references" for e in result_cron["edges"])
+        assert all(e.get("relation") != "references" for e in result_cluster["edges"])
+
+
 def test_extract_argo_emits_depends_on_edges_for_dag_task_dependencies():
     """Argo dag tasks with a non-empty dependencies list emit depends_on edges
     from the dependent task's template to each dependency task's template,

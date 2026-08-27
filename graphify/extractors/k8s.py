@@ -189,6 +189,7 @@ def _extract_argo(path: Path, raw_text: str) -> dict:
     """Extract Argo workflow, template nodes, and within-doc invokes edges."""
     nodes = []
     edges = []
+    argo_candidates = []
     for i, doc in enumerate(yaml.safe_load_all(raw_text)):
         if not isinstance(doc, dict):
             continue
@@ -200,6 +201,7 @@ def _extract_argo(path: Path, raw_text: str) -> dict:
             "source_file": str(path),
             "source_location": f"doc{i}",
         }
+        workflow_id = f"argo://{namespace}/{kind}/{name}"
         workflow_attrs = {"kind": kind, "namespace": namespace}
         spec = doc.get("spec")
         if isinstance(spec, dict):
@@ -208,13 +210,38 @@ def _extract_argo(path: Path, raw_text: str) -> dict:
                 workflow_attrs["entrypoint"] = entrypoint
         nodes.append(
             {
-                "id": f"argo://{namespace}/{kind}/{name}",
+                "id": workflow_id,
                 "label": f"{kind}/{name}",
                 "file_type": "argo",
                 **source,
                 "attributes": workflow_attrs,
             }
         )
+        if isinstance(spec, dict):
+            ref_spec = spec.get("workflowSpec")
+            if not isinstance(ref_spec, dict):
+                ref_spec = spec
+            for ref_key, target_kind in (
+                ("workflowTemplateRef", "WorkflowTemplate"),
+                ("clusterWorkflowTemplateRef", "ClusterWorkflowTemplate"),
+            ):
+                ref = ref_spec.get(ref_key)
+                if not isinstance(ref, dict) or not isinstance(ref.get("name"), str):
+                    continue
+                ref_name = ref["name"]
+                if not ref_name:
+                    continue
+                ref_ns = namespace if target_kind == "WorkflowTemplate" else "_cluster"
+                argo_candidates.append(
+                    {
+                        "source": workflow_id,
+                        "target_name": ref_name,
+                        "target_kind": target_kind,
+                        "namespace": ref_ns,
+                        "source_file": str(path),
+                        "relation": "references",
+                    }
+                )
         templates = spec.get("templates") if isinstance(spec, dict) else None
         if isinstance(templates, list):
             for t in templates:
@@ -252,7 +279,7 @@ def _extract_argo(path: Path, raw_text: str) -> dict:
                 nodes,
                 edges,
             )
-    return {"nodes": nodes, "edges": edges, "k8s_candidates": []}
+    return {"nodes": nodes, "edges": edges, "k8s_candidates": [], "argo_candidates": argo_candidates}
 
 
 def _emit_argo_invokes(
