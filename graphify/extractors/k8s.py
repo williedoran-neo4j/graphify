@@ -323,11 +323,46 @@ def _emit_argo_invokes(
         if isinstance(dag, dict):
             tasks = dag.get("tasks")
             if isinstance(tasks, list):
+                task_name_to_template = {
+                    task["name"]: task["template"]
+                    for task in tasks
+                    if isinstance(task, dict)
+                    and isinstance(task.get("name"), str)
+                    and isinstance(task.get("template"), str)
+                    and task["template"]
+                }
                 for task in tasks:
-                    if isinstance(task, dict):
-                        ref = task.get("template")
-                        if isinstance(ref, str) and ref:
-                            _edge(ref, container_id)
+                    if not isinstance(task, dict):
+                        continue
+                    ref = task.get("template")
+                    if isinstance(ref, str) and ref:
+                        _edge(ref, container_id)
+                    this_template = task.get("template")
+                    dependencies = task.get("dependencies")
+                    if (
+                        isinstance(this_template, str)
+                        and this_template
+                        and isinstance(dependencies, list)
+                        and dependencies
+                    ):
+                        dep_source = f"argo://{namespace}/{kind}/{name}/{this_template}"
+                        for dep_name in dependencies:
+                            if not isinstance(dep_name, str):
+                                continue
+                            dep_template = task_name_to_template.get(dep_name)
+                            if dep_template is None:
+                                continue
+                            edges.append(
+                                {
+                                    "source": dep_source,
+                                    "target": (
+                                        f"argo://{namespace}/{kind}/{name}/{dep_template}"
+                                    ),
+                                    "relation": "depends_on",
+                                    "confidence": "INFERRED",
+                                    "source_file": source["source_file"],
+                                }
+                            )
         steps = t.get("steps")
         if isinstance(steps, list):
             for group in steps:

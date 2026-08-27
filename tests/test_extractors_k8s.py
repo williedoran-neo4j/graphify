@@ -1251,3 +1251,66 @@ spec:
             "attributes": {"unresolved": True},
         }
 
+
+def test_extract_argo_emits_depends_on_edges_for_dag_task_dependencies():
+    """Argo dag tasks with a non-empty dependencies list emit depends_on edges
+    from the dependent task's template to each dependency task's template,
+    always with INFERRED confidence. The dependency list references sibling
+    task names, not template names directly."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        wftmpl = td_path / "depends-on-test.yaml"
+        wftmpl.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: pipeline
+  namespace: data-team
+spec:
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: produce-task
+            template: produce
+          - name: consume-task
+            template: consume
+            dependencies:
+              - produce-task
+    - name: produce
+      container:
+        image: alpine:3.20
+    - name: consume
+      container:
+        image: alpine:3.20
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(wftmpl)
+        edges = result["edges"]
+
+        # The sole depends_on edge: consume template -> produce template
+        depends_on_edges = [e for e in edges if e.get("relation") == "depends_on"]
+        assert len(depends_on_edges) == 1, (
+            f"Expected exactly 1 depends_on edge, got {len(depends_on_edges)}: {depends_on_edges}"
+        )
+
+        edge = depends_on_edges[0]
+        assert edge == {
+            "source": "argo://data-team/WorkflowTemplate/pipeline/consume",
+            "target": "argo://data-team/WorkflowTemplate/pipeline/produce",
+            "relation": "depends_on",
+            "confidence": "INFERRED",
+            "source_file": str(wftmpl),
+        }
+
+        # Invokes edges from C3 are still produced alongside depends_on.
+        invokes_edges = [e for e in edges if e.get("relation") == "invokes"]
+        assert len(invokes_edges) == 2, (
+            f"Expected 2 invokes edges, got {len(invokes_edges)}: {invokes_edges}"
+        )
+
