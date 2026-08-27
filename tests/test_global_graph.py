@@ -385,3 +385,86 @@ def test_global_add_rejects_oversized_source_graph(monkeypatch, tmp_path):
         from graphify.global_graph import global_add
         with pytest.raises(ValueError, match="exceeds"):
             global_add(src_graph, "repoA")
+
+
+def test_two_repos_k8s_same_raw_id_distinct_composed_nodes(tmp_path):
+    """Two repos with identical K8s manifests produce the same raw id; the extractor
+    emits no repo tag, and global_add prefixes each into a distinct node so both
+    coexist with correct local_id recovery."""
+    from graphify.extractors.k8s import extract_k8s
+
+    manifest_a = tmp_path / "repo_a" / "deployment.yaml"
+    manifest_a.parent.mkdir(parents=True)
+    manifest_a.write_text(
+        """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+""",
+        encoding="utf-8",
+    )
+
+    manifest_b = tmp_path / "repo_b" / "deployment.yaml"
+    manifest_b.parent.mkdir(parents=True)
+    manifest_b.write_text(
+        """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+""",
+        encoding="utf-8",
+    )
+
+    # --- Extractor: raw ids, no repo tag leakage ---
+    result_a = extract_k8s(manifest_a)
+    result_b = extract_k8s(manifest_b)
+
+    assert len(result_a["nodes"]) == 1
+    assert len(result_b["nodes"]) == 1
+    raw_id = "k8s://payments/Deployment/api-server"
+    assert result_a["nodes"][0]["id"] == raw_id
+    assert result_b["nodes"][0]["id"] == raw_id
+
+    # Assemble source graphs from nodes+edges only (drop k8s_candidates).
+    g1 = tmp_path / "graph_a.json"
+    g2 = tmp_path / "graph_b.json"
+    G_a = _make_graph(result_a["nodes"], result_a["edges"])
+    G_b = _make_graph(result_b["nodes"], result_b["edges"])
+    _graph_to_json(G_a, g1)
+    _graph_to_json(G_b, g2)
+
+    # --- Compose under global_add with isolation ---
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "repo_a")
+        global_add(g2, "repo_b")
+        G = _load_global_graph()
+
+    id_a = "repo_a::k8s://payments/Deployment/api-server"
+    id_b = "repo_b::k8s://payments/Deployment/api-server"
+
+    assert id_a in G.nodes
+    assert id_b in G.nodes
+    assert G.number_of_nodes() == 2
+
+    assert G.nodes[id_a]["repo"] == "repo_a"
+    assert G.nodes[id_a]["local_id"] == "k8s://payments/Deployment/api-server"
+    assert G.nodes[id_b]["repo"] == "repo_b"
+    assert G.nodes[id_b]["local_id"] == "k8s://payments/Deployment/api-server"
