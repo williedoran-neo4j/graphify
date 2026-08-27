@@ -144,6 +144,50 @@ def _candidates(doc: dict, base: dict) -> list[dict]:
     return out
 
 
+def _resolve_k8s_references(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve K8s manifest references into edges (pass 2).
+
+    Builds a (namespace, kind, name) -> node_id index from all_nodes and, for
+    each candidate in per_file's k8s_candidates, appends a references edge.
+    """
+    index = {}
+    for node in all_nodes:
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or not node_id.startswith("k8s://"):
+            continue
+        namespace, kind, name = node_id[len("k8s://"):].split("/", 2)
+        index[(namespace, kind, name)] = node_id
+    for entry in per_file:
+        for candidate in entry.get("k8s_candidates") or []:
+            if candidate.get("relation") != "references":
+                continue
+            target = index.get(
+                (
+                    candidate["namespace"],
+                    candidate["target_kind"],
+                    candidate["target_name"],
+                )
+            )
+            if target is None:
+                continue
+            all_edges.append(
+                {
+                    "source": (
+                        f"k8s://{candidate['namespace']}/"
+                        f"{candidate['source_kind']}/{candidate['source_name']}"
+                    ),
+                    "target": target,
+                    "relation": "references",
+                    "confidence": "EXTRACTED",
+                    "source_file": candidate["source_file"],
+                }
+            )
+
+
 def _container_names(doc: dict) -> list[str]:
     """Return container names for Deployment-like and Pod manifests."""
     spec = doc.get("spec")

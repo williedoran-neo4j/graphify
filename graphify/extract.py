@@ -46,7 +46,7 @@ from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
-from graphify.extractors.k8s import extract_k8s  # noqa: F401
+from graphify.extractors.k8s import _resolve_k8s_references, extract_k8s  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
 from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE  # noqa: F401
 from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
@@ -4149,6 +4149,11 @@ register_language_resolver(
     LanguageResolver(
         "csharp_interface_dispatch", frozenset({".cs"}), resolve_csharp_interface_dispatch
     )
+)
+# K8s YAML reference resolution: candidates stamped by extract_k8s (envFrom,
+# env.valueFrom, volumes) become references edges to same-namespace nodes.
+register_language_resolver(
+    LanguageResolver("k8s_yaml", frozenset({".yaml", ".yml"}), _resolve_k8s_references)
 )
 
 

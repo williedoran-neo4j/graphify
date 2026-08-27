@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from graphify.extractors.k8s import Dialect, detect_dialect, extract_k8s
+from graphify.extractors.k8s import (
+    Dialect,
+    _resolve_k8s_references,
+    detect_dialect,
+    extract_k8s,
+)
 
 
 def test_detect_dialect_classifies_k8s_manifests_and_rejects_everything_else():
@@ -467,4 +472,96 @@ def test_yaml_is_code_and_dispatched_to_extract_k8s():
     # Dispatch boundary: _get_extractor must route to extract_k8s.
     assert _get_extractor(Path("deploy.yaml")) is extract_k8s
     assert _get_extractor(Path("setup.yml")) is extract_k8s
+
+
+def test_resolve_k8s_references_emits_exact_references_edges_with_extracted_confidence():
+    """Pass 2 resolution: candidates for same-namespace references become edges
+    with all five required fields and EXTRACTED confidence. Non-k8s nodes are
+    ignored by the index. No candidates means no edges appended."""
+    all_nodes = [
+        {
+            "id": "k8s://payments/Deployment/api-server",
+            "label": "Deployment/api-server",
+            "file_type": "k8s",
+            "source_file": "dep.yaml",
+            "attributes": {"kind": "Deployment", "namespace": "payments"},
+        },
+        {
+            "id": "k8s://payments/ConfigMap/envfrom-cm",
+            "label": "ConfigMap/envfrom-cm",
+            "file_type": "k8s",
+            "source_file": "cm.yaml",
+            "attributes": {"kind": "ConfigMap", "namespace": "payments"},
+        },
+        {
+            "id": "k8s://payments/Secret/envfrom-sec",
+            "label": "Secret/envfrom-sec",
+            "file_type": "k8s",
+            "source_file": "sec.yaml",
+            "attributes": {"kind": "Secret", "namespace": "payments"},
+        },
+        # Non-k8s node must not pollute the index.
+        {
+            "id": "python://payments/whatever.py::foo",
+            "label": "foo",
+            "file_type": "python",
+            "source_file": "whatever.py",
+        },
+    ]
+
+    per_file = [
+        {
+            "nodes": [],
+            "edges": [],
+            "k8s_candidates": [
+                {
+                    "target_name": "envfrom-cm",
+                    "target_kind": "ConfigMap",
+                    "namespace": "payments",
+                    "relation": "references",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "api-server",
+                },
+                {
+                    "target_name": "envfrom-sec",
+                    "target_kind": "Secret",
+                    "namespace": "payments",
+                    "relation": "references",
+                    "source_file": "dep.yaml",
+                    "source_kind": "Deployment",
+                    "source_name": "api-server",
+                },
+            ],
+        }
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references(per_file, all_nodes, all_edges)
+
+    assert len(all_edges) == 2
+
+    cm_edge = all_edges[0]
+    assert cm_edge == {
+        "source": "k8s://payments/Deployment/api-server",
+        "target": "k8s://payments/ConfigMap/envfrom-cm",
+        "relation": "references",
+        "confidence": "EXTRACTED",
+        "source_file": "dep.yaml",
+    }
+
+    sec_edge = all_edges[1]
+    assert sec_edge == {
+        "source": "k8s://payments/Deployment/api-server",
+        "target": "k8s://payments/Secret/envfrom-sec",
+        "relation": "references",
+        "confidence": "EXTRACTED",
+        "source_file": "dep.yaml",
+    }
+
+    # --- No candidates: nothing appended ---
+    empty_per_file = [{"nodes": [], "edges": [], "k8s_candidates": []}]
+    empty_edges: list[dict] = []
+    _resolve_k8s_references(empty_per_file, all_nodes, empty_edges)
+    assert empty_edges == []
 
