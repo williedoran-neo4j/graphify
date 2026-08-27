@@ -815,3 +815,142 @@ def test_resolve_k8s_references_emits_uses_service_account_edges_extracted_and_a
         "attributes": {"unresolved": True},
     }
 
+
+def test_extract_k8s_captures_service_selector_and_workload_labels():
+    """extract_k8s adds selector to Service nodes from spec.selector and labels
+    to workload nodes from spec.template.metadata.labels (Deployment/StatefulSet)
+    or bare metadata.labels (Pod). No selector/labels keys are added when absent,
+    and a Service's own metadata.labels is never treated as a selector."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+
+        # 1. Service with spec.selector (and metadata.labels to ensure it is ignored).
+        svc = td_path / "service.yaml"
+        svc.write_text(
+            """\
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-svc
+  namespace: default
+  labels:
+    env: prod
+spec:
+  selector:
+    app: web
+    tier: frontend
+""",
+            encoding="utf-8",
+        )
+
+        # 2. Deployment with spec.template.metadata.labels.
+        dep = td_path / "deployment.yaml"
+        dep.write_text(
+            """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-dep
+  namespace: default
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+        version: v1
+    spec:
+      containers:
+        - name: app
+""",
+            encoding="utf-8",
+        )
+
+        # 3. Pod with bare metadata.labels (no template).
+        pod = td_path / "pod.yaml"
+        pod.write_text(
+            """\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-pod
+  namespace: default
+  labels:
+    app: web
+    job: worker
+spec:
+  containers:
+    - name: app
+""",
+            encoding="utf-8",
+        )
+
+        # 4. ConfigMap with no labels or selector.
+        cm = td_path / "configmap.yaml"
+        cm.write_text(
+            """\
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+  namespace: default
+""",
+            encoding="utf-8",
+        )
+
+        # 5. Service with metadata.labels but no spec.selector.
+        svc_no_selector = td_path / "service_no_selector.yaml"
+        svc_no_selector.write_text(
+            """\
+apiVersion: v1
+kind: Service
+metadata:
+  name: bare-svc
+  namespace: default
+  labels:
+    env: prod
+""",
+            encoding="utf-8",
+        )
+
+        result_svc = extract_k8s(svc)
+        result_dep = extract_k8s(dep)
+        result_pod = extract_k8s(pod)
+        result_cm = extract_k8s(cm)
+        result_svc_no = extract_k8s(svc_no_selector)
+
+        # --- Service with selector ---
+        svc_nodes = result_svc["nodes"]
+        assert len(svc_nodes) == 1
+        svc_node = svc_nodes[0]
+        assert svc_node["attributes"]["kind"] == "Service"
+        assert svc_node["attributes"]["selector"] == {"app": "web", "tier": "frontend"}
+        assert "labels" not in svc_node["attributes"]
+
+        # --- Deployment with labels ---
+        dep_nodes = result_dep["nodes"]
+        assert len(dep_nodes) == 1
+        dep_node = dep_nodes[0]
+        assert dep_node["attributes"]["labels"] == {"app": "web", "version": "v1"}
+
+        # --- Pod with labels ---
+        pod_nodes = result_pod["nodes"]
+        assert len(pod_nodes) == 1
+        pod_node = pod_nodes[0]
+        assert pod_node["attributes"]["labels"] == {"app": "web", "job": "worker"}
+
+        # --- ConfigMap: no selector/labels added ---
+        cm_nodes = result_cm["nodes"]
+        assert len(cm_nodes) == 1
+        cm_node = cm_nodes[0]
+        assert "selector" not in cm_node["attributes"]
+        assert "labels" not in cm_node["attributes"]
+
+        # --- Service with metadata.labels but no spec.selector: no selector added ---
+        svc_no_nodes = result_svc_no["nodes"]
+        assert len(svc_no_nodes) == 1
+        svc_no_node = svc_no_nodes[0]
+        assert "selector" not in svc_no_node["attributes"]
+        assert "labels" not in svc_no_node["attributes"]
+

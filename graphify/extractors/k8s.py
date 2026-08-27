@@ -53,6 +53,27 @@ def extract_k8s(path: Path) -> dict:
         containers = _container_names(doc)
         if containers:
             attributes["containers"] = containers
+        spec = doc.get("spec")
+        if isinstance(spec, dict):
+            selector = spec.get("selector")
+            if kind == "Service" and isinstance(selector, dict) and selector:
+                attributes["selector"] = selector
+        labels = None
+        if kind != "Service":
+            if isinstance(spec, dict):
+                template = spec.get("template")
+                if isinstance(template, dict):
+                    template_metadata = template.get("metadata")
+                    if isinstance(template_metadata, dict):
+                        template_labels = template_metadata.get("labels")
+                        if isinstance(template_labels, dict) and template_labels:
+                            labels = template_labels
+            if labels is None:
+                bare_labels = metadata.get("labels")
+                if isinstance(bare_labels, dict) and bare_labels:
+                    labels = bare_labels
+        if labels is not None:
+            attributes["labels"] = labels
         nodes.append(
             {
                 "id": f"k8s://{namespace}/{kind}/{name}",
