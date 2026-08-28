@@ -621,7 +621,11 @@ def _extract_kustomize(path: Path, raw_text: str) -> dict:
             if isinstance(value, list):
                 attributes[key] = value
                 for entry in value:
-                    if isinstance(entry, str):
+                    if isinstance(entry, str) and not (
+                        "://" in entry
+                        or entry.startswith("http")
+                        or entry.startswith("git")
+                    ):
                         candidates.append(
                             {
                                 "source": kustomize_id,

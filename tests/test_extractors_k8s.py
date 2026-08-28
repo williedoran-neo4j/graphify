@@ -1898,3 +1898,75 @@ components:
             "relation": "includes",
         },
     ]
+
+
+def test_extract_kustomize_skips_remote_url_candidates(tmp_path):
+    """Remote URL entries in resources, bases, and components are skipped so
+    they never become candidates that would later resolve into bogus AMBIGUOUS
+    placeholder joins. Only local paths produce kustomize_candidates."""
+    kustomization = tmp_path / "kustomization.yaml"
+    kustomization.write_text(
+        """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gds-api
+resources:
+  - https://example.com/remote.yaml
+  - ../base
+  - ./api
+  - git::https://github.com/org/repo.git//path
+  - ssh://host/path
+  - ./local
+bases:
+  - http://example.com/base.yaml
+  - ../../shared
+components:
+  - https://component.example.com/
+  - ./components/auth
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(kustomization)
+
+    dirname = tmp_path.as_posix()
+    kustomize_id = f"kustomize://{dirname}/kustomization.yaml"
+
+    candidates = result["kustomize_candidates"]
+    assert candidates == [
+        {
+            "source": kustomize_id,
+            "target_path": "../base",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "./api",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "./local",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "../../shared",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "./components/auth",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+    ]
