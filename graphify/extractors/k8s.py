@@ -622,6 +622,9 @@ def _resolve_kustomize_includes(
             continue
         if "#" in node_id:
             continue
+        attributes = node.get("attributes") or {}
+        if "generator" in attributes:
+            continue
         source_file = node.get("source_file")
         if not isinstance(source_file, str):
             continue

@@ -2040,3 +2040,72 @@ components:
             "relation": "includes",
         },
     ]
+
+
+def test_resolve_kustomize_includes_excludes_generated_nodes_from_index():
+    """A generated ConfigMap/Secret node shares the same source_file as its parent
+    kustomization node and has a k8s:// id with no '#'. If the index does not
+    exclude generated nodes, the generated node overwrites the kustomization
+    node (last-write-wins), causing an 'includes' edge to target the generated
+    resource instead of the kustomization file. The index must skip nodes that
+    have both generator and generated_by attributes."""
+    kustomize_id = "kustomize://base/kustomization.yaml"
+    kustomize_source = "base/kustomization.yaml"
+
+    all_nodes = [
+        # The kustomization node (must come first to show the bug — generated
+        # node coming AFTER overwrites the index entry).
+        {
+            "id": kustomize_id,
+            "label": "kustomization.yaml",
+            "file_type": "kustomize",
+            "source_file": kustomize_source,
+            "source_location": "doc0",
+            "attributes": {"dir": "base", "namespace": "_cluster"},
+        },
+        # The generated ConfigMap node — same source_file, k8s:// id, no '#'.
+        # In the current bug this overwrites the kustomization node in the index.
+        {
+            "id": "k8s://_cluster/ConfigMap/foo",
+            "label": "ConfigMap/foo",
+            "file_type": "k8s",
+            "source_file": kustomize_source,
+            "source_location": "doc0",
+            "attributes": {
+                "kind": "ConfigMap",
+                "generated_by": kustomize_id,
+                "generator": "configMapGenerator",
+                "name": "foo",
+            },
+        },
+    ]
+
+    per_file = [
+        {
+            "nodes": [],
+            "edges": [],
+            "k8s_candidates": [],
+            "kustomize_candidates": [
+                {
+                    "source": "kustomize://overlays/prod/kustomization.yaml",
+                    "target_path": "../../base/kustomization.yaml",
+                    "dir": "overlays/prod",
+                    "source_file": "overlays/prod/kustomization.yaml",
+                    "relation": "includes",
+                },
+            ],
+        }
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_kustomize_includes(per_file, all_nodes, all_edges)
+
+    extracted = [e for e in all_edges if e.get("confidence") == "EXTRACTED"]
+    assert len(extracted) == 1, f"Expected 1 EXTRACTED edge, got {len(extracted)}: {extracted!r}"
+    assert extracted[0] == {
+        "source": "kustomize://overlays/prod/kustomization.yaml",
+        "target": kustomize_id,
+        "relation": "includes",
+        "confidence": "EXTRACTED",
+        "source_file": "overlays/prod/kustomization.yaml",
+    }
