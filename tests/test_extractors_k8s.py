@@ -1913,7 +1913,7 @@ def test_resolve_kustomize_includes_emits_extracted_edge_for_resolved_path_and_n
         {
             "id": kustomize_id,
             "label": "kustomization.yaml",
-            "file_type": "kustomize",
+            "file_type": "k8s",
             "source_file": kustomize_source,
             "source_location": "doc0",
             "attributes": {"dir": "overlays/prod", "namespace": "prod"},
@@ -2058,7 +2058,7 @@ def test_resolve_kustomize_includes_excludes_generated_nodes_from_index():
         {
             "id": kustomize_id,
             "label": "kustomization.yaml",
-            "file_type": "kustomize",
+            "file_type": "k8s",
             "source_file": kustomize_source,
             "source_location": "doc0",
             "attributes": {"dir": "base", "namespace": "_cluster"},
@@ -2109,3 +2109,111 @@ def test_resolve_kustomize_includes_excludes_generated_nodes_from_index():
         "confidence": "EXTRACTED",
         "source_file": "overlays/prod/kustomization.yaml",
     }
+
+
+def test_resolve_kustomize_includes_ambiguous_unresolved_paths():
+    """Unresolved kustomize includes emit AMBIGUOUS edges with deduplicated
+    placeholder nodes.
+
+    Two different missing paths produce two AMBIGUOUS edges and two placeholder
+    nodes. Two candidates referencing the same missing path produce two edges
+    but only one placeholder node (deduplicated by the resolved path).
+
+    Placeholder nodes use file_type 'kustomize' matching their kustomize:// id
+    scheme, consistent with argo/k8s placeholder conventions.
+    """
+    all_nodes: list[dict] = []
+    all_edges: list[dict] = []
+
+    per_file = [
+        {
+            "nodes": [],
+            "edges": [],
+            "k8s_candidates": [],
+            "kustomize_candidates": [
+                # Two different unresolved paths
+                {
+                    "source": "kustomize://overlays/prod/kustomization.yaml",
+                    "target_path": "./missing-a.yaml",
+                    "dir": "overlays/prod",
+                    "source_file": "overlays/prod/kustomization.yaml",
+                    "relation": "includes",
+                },
+                {
+                    "source": "kustomize://overlays/prod/kustomization.yaml",
+                    "target_path": "./missing-b.yaml",
+                    "dir": "overlays/prod",
+                    "source_file": "overlays/prod/kustomization.yaml",
+                    "relation": "includes",
+                },
+                # Same missing path as the first — should dedup placeholder node
+                {
+                    "source": "kustomize://overlays/prod/kustomization.yaml",
+                    "target_path": "./missing-a.yaml",
+                    "dir": "overlays/prod",
+                    "source_file": "overlays/prod/kustomization.yaml",
+                    "relation": "includes",
+                },
+            ],
+        }
+    ]
+
+    _resolve_kustomize_includes(per_file, all_nodes, all_edges)
+
+    ambiguous = [e for e in all_edges if e.get("confidence") == "AMBIGUOUS"]
+    assert len(ambiguous) == 3, (
+        f"Expected 3 AMBIGUOUS edges, got {len(ambiguous)}: {ambiguous!r}"
+    )
+
+    placeholder_nodes = [
+        n for n in all_nodes if n.get("id", "").endswith("#unresolved")
+    ]
+    assert len(placeholder_nodes) == 2, (
+        f"Expected 2 placeholder nodes, got {len(placeholder_nodes)}: {placeholder_nodes!r}"
+    )
+
+    missing_a_id = "kustomize://overlays/prod/missing-a.yaml#unresolved"
+    missing_a_node = next(n for n in placeholder_nodes if n["id"] == missing_a_id)
+    assert missing_a_node == {
+        "id": missing_a_id,
+        "label": "missing-a.yaml (unresolved)",
+        "file_type": "kustomize",
+        "source_file": "overlays/prod/kustomization.yaml",
+        "attributes": {"unresolved": True},
+    }
+
+    missing_b_id = "kustomize://overlays/prod/missing-b.yaml#unresolved"
+    missing_b_node = next(n for n in placeholder_nodes if n["id"] == missing_b_id)
+    assert missing_b_node == {
+        "id": missing_b_id,
+        "label": "missing-b.yaml (unresolved)",
+        "file_type": "kustomize",
+        "source_file": "overlays/prod/kustomization.yaml",
+        "attributes": {"unresolved": True},
+    }
+
+    expected_edges = [
+        {
+            "source": "kustomize://overlays/prod/kustomization.yaml",
+            "target": missing_a_id,
+            "relation": "includes",
+            "confidence": "AMBIGUOUS",
+            "source_file": "overlays/prod/kustomization.yaml",
+        },
+        {
+            "source": "kustomize://overlays/prod/kustomization.yaml",
+            "target": missing_b_id,
+            "relation": "includes",
+            "confidence": "AMBIGUOUS",
+            "source_file": "overlays/prod/kustomization.yaml",
+        },
+        {
+            "source": "kustomize://overlays/prod/kustomization.yaml",
+            "target": missing_a_id,
+            "relation": "includes",
+            "confidence": "AMBIGUOUS",
+            "source_file": "overlays/prod/kustomization.yaml",
+        },
+    ]
+    for exp in expected_edges:
+        assert any(e == exp for e in ambiguous), f"Missing expected edge {exp!r}"

@@ -630,6 +630,7 @@ def _resolve_kustomize_includes(
             continue
         source_path = Path(source_file)
         index[(source_path.parent, source_path.name)] = node_id
+    placeholder_ids = set()
     for entry in per_file:
         for candidate in entry.get("kustomize_candidates") or []:
             resolved = posixpath.normpath(
@@ -637,6 +638,27 @@ def _resolve_kustomize_includes(
             )
             target = index.get((Path(resolved).parent, Path(resolved).name))
             if target is None:
+                unresolved_id = f"kustomize://{resolved}#unresolved"
+                all_edges.append(
+                    {
+                        "source": candidate["source"],
+                        "target": unresolved_id,
+                        "relation": "includes",
+                        "confidence": "AMBIGUOUS",
+                        "source_file": candidate["source_file"],
+                    }
+                )
+                if unresolved_id not in placeholder_ids:
+                    placeholder_ids.add(unresolved_id)
+                    all_nodes.append(
+                        {
+                            "id": unresolved_id,
+                            "label": f"{Path(resolved).name} (unresolved)",
+                            "file_type": "kustomize",
+                            "source_file": candidate["source_file"],
+                            "attributes": {"unresolved": True},
+                        }
+                    )
                 continue
             all_edges.append(
                 {
