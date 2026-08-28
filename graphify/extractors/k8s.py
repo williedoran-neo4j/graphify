@@ -72,6 +72,8 @@ def extract_k8s(path: Path) -> dict:
     dialect = detect_dialect(path, raw_text)
     if dialect is Dialect.ARGO_WORKFLOW:
         return _extract_argo(path, raw_text)
+    if dialect is Dialect.KUSTOMIZATION:
+        return _extract_kustomize(path, raw_text)
     if dialect is not Dialect.K8S_MANIFEST:
         return {"nodes": [], "edges": [], "k8s_candidates": []}
     nodes = []
@@ -597,6 +599,32 @@ def _resolve_k8s_references(
                         "source_file": svc["source_file"],
                     }
                 )
+
+
+def _extract_kustomize(path: Path, raw_text: str) -> dict:
+    """Extract a kustomization manifest into a single node."""
+    dirname = path.parent.as_posix()
+    attributes = {"dir": dirname, "namespace": "_cluster"}
+    for doc in yaml.safe_load_all(raw_text):
+        if not isinstance(doc, dict):
+            continue
+        namespace = doc.get("namespace")
+        if isinstance(namespace, str) and namespace:
+            attributes["namespace"] = namespace
+        for key in ("resources", "bases", "components"):
+            value = doc.get(key)
+            if isinstance(value, list):
+                attributes[key] = value
+    node = {
+        "id": f"kustomize://{dirname}/{path.name}",
+        "label": path.name,
+        "file_type": "kustomize",
+        "source_file": str(path),
+        "source_location": "doc0",
+        "attributes": attributes,
+    }
+    return {"nodes": [node], "edges": [], "k8s_candidates": []}
+
 
 
 def _container_names(doc: dict) -> list[str]:

@@ -1687,3 +1687,40 @@ spec:
 
         assert result1 == result2
 
+
+def test_extract_k8s_emits_kustomize_node_for_kustomization_manifest(tmp_path):
+    """A kustomization.yaml with apiVersion kustomize.config.k8s.io/v1beta1 and
+    kind Kustomization is routed to _extract_kustomize, which emits a single node
+    with kustomize:// id, file_type='kustomize', and attributes carrying the
+    resources list, namespace, and dir path. No edges are generated."""
+    kustomization = tmp_path / "kustomization.yaml"
+    kustomization.write_text(
+        """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gds-api
+resources:
+  - ../base
+  - ./api
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(kustomization)
+
+    nodes = result["nodes"]
+    assert len(nodes) == 1, f"Expected 1 node, got {len(nodes)}: {nodes!r}"
+    node = nodes[0]
+
+    dirname = tmp_path.as_posix()
+    assert node["id"] == f"kustomize://{dirname}/kustomization.yaml"
+    assert node["label"] == "kustomization.yaml"
+    assert node["file_type"] == "kustomize"
+    assert node["source_file"] == str(kustomization)
+    assert node["source_location"] == "doc0"
+    assert node["attributes"]["dir"] == dirname
+    assert node["attributes"]["resources"] == ["../base", "./api"]
+    assert node["attributes"]["namespace"] == "gds-api"
+
+    assert result["edges"] == []
+
