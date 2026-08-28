@@ -402,6 +402,53 @@ def _emit_argo_invokes(
                             _edge(ref, container_id)
 
 
+def _resolve_argo_references(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Argo workflow references into references edges (pass 2).
+
+    Builds a (namespace, kind, name) -> node_id index from workflow-level
+    argo:// nodes only (3 path segments). For each candidate that resolves,
+    appends an EXTRACTED references edge. Non-resolving candidates are left
+    for a later ambiguous-resolution change.
+    """
+    index = {}
+    for node in all_nodes:
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or not node_id.startswith("argo://"):
+            continue
+        if "#" in node_id:
+            continue
+        rest = node_id[len("argo://"):]
+        parts = rest.split("/")
+        if len(parts) != 3:
+            continue
+        namespace, kind, name = parts
+        index[(namespace, kind, name)] = node_id
+    for entry in per_file:
+        for candidate in entry.get("argo_candidates") or []:
+            target = index.get(
+                (
+                    candidate["namespace"],
+                    candidate["target_kind"],
+                    candidate["target_name"],
+                )
+            )
+            if target is None:
+                continue
+            all_edges.append(
+                {
+                    "source": candidate["source"],
+                    "target": target,
+                    "relation": "references",
+                    "confidence": "EXTRACTED",
+                    "source_file": candidate["source_file"],
+                }
+            )
+
+
 def _resolve_k8s_references(
     per_file: list[dict],
     all_nodes: list[dict],

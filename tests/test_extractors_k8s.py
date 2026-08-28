@@ -5,6 +5,7 @@ from pathlib import Path
 
 from graphify.extractors.k8s import (
     Dialect,
+    _resolve_argo_references,
     _resolve_k8s_references,
     detect_dialect,
     extract_k8s,
@@ -1458,4 +1459,61 @@ spec:
             "source_file": str(wf),
             "relation": "references",
         }
+
+
+def test_resolve_argo_references_emits_extracted_references_edges_for_workflow_level_targets():
+    """Pass 2 resolution: argo_candidates for workflow-level targets (3-segment argo:// id)
+    become references edges with EXTRACTED confidence. Template nodes (4 segments) and
+    #unresolved/placeholder ids are excluded from the index so they are never targets."""
+    all_nodes = [
+        {
+            "id": "argo://payments/WorkflowTemplate/daily-env-cost-ingestion",
+            "label": "WorkflowTemplate/daily-env-cost-ingestion",
+            "file_type": "argo",
+            "source_file": "tmpl.yaml",
+            "attributes": {"kind": "WorkflowTemplate", "namespace": "payments"},
+        },
+        {
+            "id": "argo://payments/CronWorkflow/cron",
+            "label": "CronWorkflow/cron",
+            "file_type": "argo",
+            "source_file": "cron.yaml",
+            "attributes": {"kind": "CronWorkflow", "namespace": "payments"},
+        },
+        # Template node (4 segments) must NOT be indexed as a resolution target.
+        {
+            "id": "argo://payments/WorkflowTemplate/daily-env-cost-ingestion/main",
+            "label": "main",
+            "file_type": "argo",
+            "source_file": "tmpl.yaml",
+            "attributes": {"template": "main", "parent": "daily-env-cost-ingestion"},
+        },
+    ]
+
+    per_file = [
+        {
+            "argo_candidates": [
+                {
+                    "source": "argo://payments/CronWorkflow/cron",
+                    "target_name": "daily-env-cost-ingestion",
+                    "target_kind": "WorkflowTemplate",
+                    "namespace": "payments",
+                    "source_file": "cron.yaml",
+                    "relation": "references",
+                }
+            ]
+        }
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_argo_references(per_file, all_nodes, all_edges)
+
+    assert len(all_edges) == 1
+    assert all_edges[0] == {
+        "source": "argo://payments/CronWorkflow/cron",
+        "target": "argo://payments/WorkflowTemplate/daily-env-cost-ingestion",
+        "relation": "references",
+        "confidence": "EXTRACTED",
+        "source_file": "cron.yaml",
+    }
 
