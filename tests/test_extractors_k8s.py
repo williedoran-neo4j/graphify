@@ -1585,3 +1585,49 @@ def test_resolve_argo_references_emits_extracted_references_edges_for_workflow_l
         "source_file": "cron.yaml",
     }
 
+
+def test_extract_k8s_is_deterministic_for_argo_workflow_template():
+    """Two extract_k8s runs over an unchanged Argo WorkflowTemplate must produce
+    byte-identical node and edge dicts, so downstream build and push steps are
+    stable across re-runs."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        wftmpl = td_path / "determinism-test.yaml"
+        wftmpl.write_text(
+            """\
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: pipeline
+  namespace: data-team
+spec:
+  entrypoint: main
+  workflowTemplateRef:
+    name: shared-template
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: produce-task
+            template: produce
+          - name: consume-task
+            template: consume
+            dependencies:
+              - produce-task
+    - name: produce
+      container:
+        image: alpine:3.20
+    - name: consume
+      container:
+        image: alpine:3.20
+""",
+            encoding="utf-8",
+        )
+
+        result1 = extract_k8s(wftmpl)
+        result2 = extract_k8s(wftmpl)
+
+        assert result1 == result2
+
