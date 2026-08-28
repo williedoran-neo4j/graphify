@@ -411,8 +411,8 @@ def _resolve_argo_references(
 
     Builds a (namespace, kind, name) -> node_id index from workflow-level
     argo:// nodes only (3 path segments). For each candidate that resolves,
-    appends an EXTRACTED references edge. Non-resolving candidates are left
-    for a later ambiguous-resolution change.
+    appends an EXTRACTED references edge; unresolved candidates get an
+    AMBIGUOUS edge to a deduplicated placeholder node.
     """
     index = {}
     for node in all_nodes:
@@ -427,6 +427,7 @@ def _resolve_argo_references(
             continue
         namespace, kind, name = parts
         index[(namespace, kind, name)] = node_id
+    placeholder_ids = set()
     for entry in per_file:
         for candidate in entry.get("argo_candidates") or []:
             target = index.get(
@@ -437,6 +438,33 @@ def _resolve_argo_references(
                 )
             )
             if target is None:
+                unresolved_id = (
+                    f"argo://{candidate['namespace']}/"
+                    f"{candidate['target_kind']}/{candidate['target_name']}#unresolved"
+                )
+                all_edges.append(
+                    {
+                        "source": candidate["source"],
+                        "target": unresolved_id,
+                        "relation": "references",
+                        "confidence": "AMBIGUOUS",
+                        "source_file": candidate["source_file"],
+                    }
+                )
+                if unresolved_id not in placeholder_ids:
+                    placeholder_ids.add(unresolved_id)
+                    all_nodes.append(
+                        {
+                            "id": unresolved_id,
+                            "label": (
+                                f"{candidate['target_kind']}/"
+                                f"{candidate['target_name']} (unresolved)"
+                            ),
+                            "file_type": "argo",
+                            "source_file": candidate["source_file"],
+                            "attributes": {"unresolved": True},
+                        }
+                    )
                 continue
             all_edges.append(
                 {

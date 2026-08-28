@@ -1461,6 +1461,74 @@ spec:
         }
 
 
+def test_resolve_argo_references_emits_ambiguous_edges_and_deduped_placeholder_for_unresolved_targets():
+    """Unresolved argo_candidates emit an AMBIGUOUS references edge to a
+    #unresolved id, and exactly one placeholder node per unique unresolved target
+    (deduped across candidates, not per-candidate). Two candidates referencing the
+    same missing name produce two edges but one node."""
+    all_nodes: list[dict] = []
+    all_edges: list[dict] = []
+
+    per_file = [
+        {
+            "argo_candidates": [
+                {
+                    "source": "argo://payments/Workflow/etl-a",
+                    "target_name": "missing-wft",
+                    "target_kind": "WorkflowTemplate",
+                    "namespace": "payments",
+                    "source_file": "a.yaml",
+                    "relation": "references",
+                },
+                {
+                    "source": "argo://payments/Workflow/etl-b",
+                    "target_name": "missing-wft",
+                    "target_kind": "WorkflowTemplate",
+                    "namespace": "payments",
+                    "source_file": "b.yaml",
+                    "relation": "references",
+                },
+            ]
+        }
+    ]
+
+    _resolve_argo_references(per_file, all_nodes, all_edges)
+
+    # Two AMBIGUOUS edges, one per candidate, both pointing at the same unresolved target.
+    assert len(all_edges) == 2, (
+        f"Expected 2 AMBIGUOUS edges, got {len(all_edges)}: {all_edges!r}"
+    )
+    expected_unresolved = "argo://payments/WorkflowTemplate/missing-wft#unresolved"
+    for edge in all_edges:
+        assert edge == {
+            "source": edge["source"],
+            "target": expected_unresolved,
+            "relation": "references",
+            "confidence": "AMBIGUOUS",
+            "source_file": edge["source_file"],
+        }
+    sources = {e["source"] for e in all_edges}
+    assert sources == {
+        "argo://payments/Workflow/etl-a",
+        "argo://payments/Workflow/etl-b",
+    }
+    source_files = {e["source_file"] for e in all_edges}
+    assert source_files == {"a.yaml", "b.yaml"}
+
+    # Exactly one placeholder node for the shared unresolved target.
+    assert len(all_nodes) == 1, (
+        f"Expected 1 placeholder node, got {len(all_nodes)}: {all_nodes!r}"
+    )
+    ph = all_nodes[0]
+    assert ph == {
+        "id": expected_unresolved,
+        "label": "WorkflowTemplate/missing-wft (unresolved)",
+        "file_type": "argo",
+        "source_file": "a.yaml",
+        "attributes": {"unresolved": True},
+    }
+
+
 def test_resolve_argo_references_emits_extracted_references_edges_for_workflow_level_targets():
     """Pass 2 resolution: argo_candidates for workflow-level targets (3-segment argo:// id)
     become references edges with EXTRACTED confidence. Template nodes (4 segments) and
