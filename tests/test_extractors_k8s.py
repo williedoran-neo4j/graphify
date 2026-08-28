@@ -7,6 +7,7 @@ from graphify.extractors.k8s import (
     Dialect,
     _resolve_argo_references,
     _resolve_k8s_references,
+    _resolve_kustomize_includes,
     detect_dialect,
     extract_k8s,
 )
@@ -1898,6 +1899,75 @@ components:
             "relation": "includes",
         },
     ]
+
+
+def test_resolve_kustomize_includes_emits_extracted_edge_for_resolved_path_and_no_edge_for_unresolved():
+    """Pass 2 resolution: a kustomize_candidate whose resolved path matches a node
+    indexed by (source_dir, basename) emits an includes edge with EXTRACTED
+    confidence. A candidate whose resolved path does NOT match is not emitted as
+    EXTRACTED (that branch is AMBIGUOUS, handled separately)."""
+    kustomize_id = "kustomize://overlays/prod/kustomization.yaml"
+    kustomize_source = "overlays/prod/kustomization.yaml"
+
+    all_nodes = [
+        {
+            "id": kustomize_id,
+            "label": "kustomization.yaml",
+            "file_type": "kustomize",
+            "source_file": kustomize_source,
+            "source_location": "doc0",
+            "attributes": {"dir": "overlays/prod", "namespace": "prod"},
+        },
+        {
+            "id": "k8s://default/Deployment/api",
+            "label": "Deployment/api",
+            "file_type": "k8s",
+            "source_file": "overlays/base/deployment.yaml",
+            "source_location": "doc0",
+            "attributes": {"kind": "Deployment", "namespace": "default"},
+        },
+    ]
+
+    per_file = [
+        {
+            "nodes": [],
+            "edges": [],
+            "k8s_candidates": [],
+            "kustomize_candidates": [
+                # Resolves to overlays/base/deployment.yaml → matches the k8s node.
+                {
+                    "source": kustomize_id,
+                    "target_path": "../base/deployment.yaml",
+                    "dir": "overlays/prod",
+                    "source_file": kustomize_source,
+                    "relation": "includes",
+                },
+                # Resolves to overlays/prod/missing.yaml → no match.
+                {
+                    "source": kustomize_id,
+                    "target_path": "./missing.yaml",
+                    "dir": "overlays/prod",
+                    "source_file": kustomize_source,
+                    "relation": "includes",
+                },
+            ],
+        }
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_kustomize_includes(per_file, all_nodes, all_edges)
+
+    extracted = [e for e in all_edges if e.get("confidence") == "EXTRACTED"]
+    assert len(extracted) == 1, f"Expected 1 EXTRACTED edge, got {len(extracted)}: {extracted!r}"
+    assert extracted[0] == {
+        "source": kustomize_id,
+        "target": "k8s://default/Deployment/api",
+        "relation": "includes",
+        "confidence": "EXTRACTED",
+        "source_file": kustomize_source,
+    }
+
+    # No EXTRACTED edge was emitted for the unresolved candidate (AMBIGUOUS is C4).
 
 
 def test_extract_kustomize_skips_remote_url_candidates(tmp_path):

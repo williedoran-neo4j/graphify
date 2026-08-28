@@ -1,6 +1,7 @@
 """Kubernetes YAML extractor — dialect detection and node extraction."""
 from __future__ import annotations
 
+import posixpath
 from enum import Enum, auto
 from pathlib import Path
 
@@ -599,6 +600,50 @@ def _resolve_k8s_references(
                         "source_file": svc["source_file"],
                     }
                 )
+
+
+def _resolve_kustomize_includes(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Kustomize includes candidates into EXTRACTED edges (pass 2).
+
+    Indexes Kustomize/K8s nodes by the (directory, basename) of their
+    source_file, then appends an includes edge for each candidate whose
+    resolved path matches an indexed node.
+    """
+    index = {}
+    for node in all_nodes:
+        node_id = node.get("id")
+        if not isinstance(node_id, str):
+            continue
+        if not (node_id.startswith("kustomize://") or node_id.startswith("k8s://")):
+            continue
+        if "#" in node_id:
+            continue
+        source_file = node.get("source_file")
+        if not isinstance(source_file, str):
+            continue
+        source_path = Path(source_file)
+        index[(source_path.parent, source_path.name)] = node_id
+    for entry in per_file:
+        for candidate in entry.get("kustomize_candidates") or []:
+            resolved = posixpath.normpath(
+                posixpath.join(candidate["dir"], candidate["target_path"])
+            )
+            target = index.get((Path(resolved).parent, Path(resolved).name))
+            if target is None:
+                continue
+            all_edges.append(
+                {
+                    "source": candidate["source"],
+                    "target": target,
+                    "relation": "includes",
+                    "confidence": "EXTRACTED",
+                    "source_file": candidate["source_file"],
+                }
+            )
 
 
 def _extract_kustomize(path: Path, raw_text: str) -> dict:
