@@ -10,6 +10,7 @@ import yaml
 class Dialect(Enum):
     K8S_MANIFEST = auto()
     ARGO_WORKFLOW = auto()
+    KUSTOMIZATION = auto()
 
 
 def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
@@ -28,6 +29,8 @@ def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
     }
     saw_argo = False
     all_argo = True
+    saw_kustomize = False
+    all_kustomize = True
     for doc in docs:
         if not isinstance(doc, dict):
             return None
@@ -39,11 +42,20 @@ def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
             if kind not in argo_kinds:
                 return None
             saw_argo = True
+            all_kustomize = False
+        elif api_version.startswith("kustomize.config.k8s.io/"):
+            if kind != "Kustomization":
+                return None
+            saw_kustomize = True
+            all_argo = False
         else:
             all_argo = False
+            all_kustomize = False
     if all_argo:
         return Dialect.ARGO_WORKFLOW
-    if saw_argo:
+    if all_kustomize:
+        return Dialect.KUSTOMIZATION
+    if saw_argo or saw_kustomize:
         return None
     return Dialect.K8S_MANIFEST
 

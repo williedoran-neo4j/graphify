@@ -107,6 +107,62 @@ kind: MissingApiVersion
     assert detect_dialect(p, mixed) is None
 
 
+def test_detect_dialect_classifies_kustomization_and_rejects_mixed_and_non_kustomization_kinds():
+    """detect_dialect returns KUSTOMIZATION only when every YAML document has an
+    apiVersion starting with kustomize.config.k8s.io/ and kind == Kustomization.
+    Mixed files, plain K8s manifests, and Argo manifests return None or their
+    respective dialects."""
+    p = Path("/dev/null")
+
+    # Single Kustomization — valid kustomization dialect.
+    kustomization = """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+"""
+    assert detect_dialect(p, kustomization) is Dialect.KUSTOMIZATION
+
+    # Multi-document Kustomization — still valid when every doc is Kustomization.
+    multi_kustomization = """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ./api
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ./web
+"""
+    assert detect_dialect(p, multi_kustomization) is Dialect.KUSTOMIZATION
+
+    # Mixed multi-doc: Kustomization + plain K8s ConfigMap → None.
+    mixed_kustomization_k8s = """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+"""
+    assert detect_dialect(p, mixed_kustomization_k8s) is None
+
+    # Argo workflow with kustomize-like name but argo apiVersion → ARGO_WORKFLOW.
+    argo_workflow = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: my-flow
+"""
+    assert detect_dialect(p, argo_workflow) is Dialect.ARGO_WORKFLOW
+
+    # Plain K8s still covered by other tests; not re-asserted here.
+
+
 def test_detect_dialect_classifies_argo_workflow_manifests_and_rejects_mixed_and_non_workflow_kinds():
     """detect_dialect returns ARGO_WORKFLOW only when every YAML document has an
     apiVersion starting with argoproj.io/ and a kind in the workflow set.
