@@ -1724,3 +1724,117 @@ resources:
 
     assert result["edges"] == []
 
+
+def test_extract_kustomize_emits_generated_nodes_and_generates_edges(tmp_path):
+    """A kustomization with configMapGenerator and secretGenerator entries yields
+    one ConfigMap node per configMapGenerator entry and one Secret node per
+    secretGenerator entry, each with a k8s:// id, plus a generates edge from the
+    kustomization node to each generated node with EXTRACTED confidence. The
+    generator namespace is used, not the kustomization namespace."""
+    kustomization = tmp_path / "kustomization.yaml"
+    kustomization.write_text(
+        """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gds-api
+resources:
+  - ../base
+configMapGenerator:
+  - name: gds-api-session-sizing
+    namespace: overlay
+  - name: gds-api-config
+secretGenerator:
+  - name: gds-api-secret
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(kustomization)
+
+    nodes = result["nodes"]
+    edges = result["edges"]
+    dirname = tmp_path.as_posix()
+    kustomize_id = f"kustomize://{dirname}/kustomization.yaml"
+
+    # Total nodes = 1 kustomization + 2 configMapGenerator entries + 1 secretGenerator entry
+    assert len(nodes) == 4, f"Expected 4 nodes, got {len(nodes)}: {nodes!r}"
+
+    # Kustomization node still present
+    kustomize_node = next(n for n in nodes if n["id"] == kustomize_id)
+    assert kustomize_node is not None
+
+    # Generated ConfigMap nodes
+    cm1 = next(n for n in nodes if n["id"] == "k8s://overlay/ConfigMap/gds-api-session-sizing")
+    assert cm1 == {
+        "id": "k8s://overlay/ConfigMap/gds-api-session-sizing",
+        "label": "ConfigMap/gds-api-session-sizing",
+        "file_type": "k8s",
+        "source_file": str(kustomization),
+        "source_location": "doc0",
+        "attributes": {
+            "kind": "ConfigMap",
+            "generated_by": kustomize_id,
+            "generator": "configMapGenerator",
+            "name": "gds-api-session-sizing",
+        },
+    }
+
+    cm2 = next(n for n in nodes if n["id"] == "k8s://_cluster/ConfigMap/gds-api-config")
+    assert cm2 == {
+        "id": "k8s://_cluster/ConfigMap/gds-api-config",
+        "label": "ConfigMap/gds-api-config",
+        "file_type": "k8s",
+        "source_file": str(kustomization),
+        "source_location": "doc0",
+        "attributes": {
+            "kind": "ConfigMap",
+            "generated_by": kustomize_id,
+            "generator": "configMapGenerator",
+            "name": "gds-api-config",
+        },
+    }
+
+    # Generated Secret node (no namespace → defaults to _cluster)
+    sec = next(n for n in nodes if n["id"] == "k8s://_cluster/Secret/gds-api-secret")
+    assert sec == {
+        "id": "k8s://_cluster/Secret/gds-api-secret",
+        "label": "Secret/gds-api-secret",
+        "file_type": "k8s",
+        "source_file": str(kustomization),
+        "source_location": "doc0",
+        "attributes": {
+            "kind": "Secret",
+            "generated_by": kustomize_id,
+            "generator": "secretGenerator",
+            "name": "gds-api-secret",
+        },
+    }
+
+    # generates edges: one per generated node, always EXTRACTED
+    assert len(edges) == 3, f"Expected 3 edges, got {len(edges)}: {edges!r}"
+
+    expected_edges = [
+        {
+            "source": kustomize_id,
+            "target": "k8s://overlay/ConfigMap/gds-api-session-sizing",
+            "relation": "generates",
+            "confidence": "EXTRACTED",
+            "source_file": str(kustomization),
+        },
+        {
+            "source": kustomize_id,
+            "target": "k8s://_cluster/ConfigMap/gds-api-config",
+            "relation": "generates",
+            "confidence": "EXTRACTED",
+            "source_file": str(kustomization),
+        },
+        {
+            "source": kustomize_id,
+            "target": "k8s://_cluster/Secret/gds-api-secret",
+            "relation": "generates",
+            "confidence": "EXTRACTED",
+            "source_file": str(kustomization),
+        },
+    ]
+    for exp in expected_edges:
+        assert any(e == exp for e in edges), f"Missing expected edge {exp!r}"

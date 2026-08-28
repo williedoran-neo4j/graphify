@@ -602,9 +602,12 @@ def _resolve_k8s_references(
 
 
 def _extract_kustomize(path: Path, raw_text: str) -> dict:
-    """Extract a kustomization manifest into a single node."""
+    """Extract a kustomization node plus one generated-resource node per
+    configMapGenerator/secretGenerator entry and a generates edge per node."""
     dirname = path.parent.as_posix()
     attributes = {"dir": dirname, "namespace": "_cluster"}
+    nodes = []
+    edges = []
     for doc in yaml.safe_load_all(raw_text):
         if not isinstance(doc, dict):
             continue
@@ -623,7 +626,50 @@ def _extract_kustomize(path: Path, raw_text: str) -> dict:
         "source_location": "doc0",
         "attributes": attributes,
     }
-    return {"nodes": [node], "edges": [], "k8s_candidates": []}
+    nodes.append(node)
+    for doc in yaml.safe_load_all(raw_text):
+        if not isinstance(doc, dict):
+            continue
+        for generator, kind in (
+            ("configMapGenerator", "ConfigMap"),
+            ("secretGenerator", "Secret"),
+        ):
+            entries = doc.get(generator)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                generated_namespace = entry.get("namespace") or "_cluster"
+                generated_id = f"k8s://{generated_namespace}/{kind}/{name}"
+                nodes.append(
+                    {
+                        "id": generated_id,
+                        "label": f"{kind}/{name}",
+                        "file_type": "k8s",
+                        "source_file": str(path),
+                        "source_location": "doc0",
+                        "attributes": {
+                            "kind": kind,
+                            "generated_by": node["id"],
+                            "generator": generator,
+                            "name": name,
+                        },
+                    }
+                )
+                edges.append(
+                    {
+                        "source": node["id"],
+                        "target": generated_id,
+                        "relation": "generates",
+                        "confidence": "EXTRACTED",
+                        "source_file": str(path),
+                    }
+                )
+    return {"nodes": nodes, "edges": edges, "k8s_candidates": []}
 
 
 
