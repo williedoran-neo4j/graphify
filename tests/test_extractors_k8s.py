@@ -1838,3 +1838,63 @@ secretGenerator:
     ]
     for exp in expected_edges:
         assert any(e == exp for e in edges), f"Missing expected edge {exp!r}"
+
+
+def test_extract_kustomize_stashes_kustomize_candidates_for_string_entries(tmp_path):
+    """A kustomization with resources, bases, and components lists emits one
+    kustomize_candidate per string entry, shaped with source, target_path, dir,
+    source_file, and relation 'includes'. Non-string entries are skipped."""
+    kustomization = tmp_path / "kustomization.yaml"
+    kustomization.write_text(
+        """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gds-api
+resources:
+  - ../base
+  - ./api
+bases:
+  - ../../shared
+components:
+  - ./components/auth
+  - {not: a string}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(kustomization)
+
+    dirname = tmp_path.as_posix()
+    kustomize_id = f"kustomize://{dirname}/kustomization.yaml"
+
+    candidates = result["kustomize_candidates"]
+    assert candidates == [
+        {
+            "source": kustomize_id,
+            "target_path": "../base",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "./api",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "../../shared",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+        {
+            "source": kustomize_id,
+            "target_path": "./components/auth",
+            "dir": dirname,
+            "source_file": str(kustomization),
+            "relation": "includes",
+        },
+    ]

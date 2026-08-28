@@ -605,7 +605,9 @@ def _extract_kustomize(path: Path, raw_text: str) -> dict:
     """Extract a kustomization node plus one generated-resource node per
     configMapGenerator/secretGenerator entry and a generates edge per node."""
     dirname = path.parent.as_posix()
+    kustomize_id = f"kustomize://{dirname}/{path.name}"
     attributes = {"dir": dirname, "namespace": "_cluster"}
+    candidates = []
     nodes = []
     edges = []
     for doc in yaml.safe_load_all(raw_text):
@@ -618,8 +620,19 @@ def _extract_kustomize(path: Path, raw_text: str) -> dict:
             value = doc.get(key)
             if isinstance(value, list):
                 attributes[key] = value
+                for entry in value:
+                    if isinstance(entry, str):
+                        candidates.append(
+                            {
+                                "source": kustomize_id,
+                                "target_path": entry,
+                                "dir": dirname,
+                                "source_file": str(path),
+                                "relation": "includes",
+                            }
+                        )
     node = {
-        "id": f"kustomize://{dirname}/{path.name}",
+        "id": kustomize_id,
         "label": path.name,
         "file_type": "kustomize",
         "source_file": str(path),
@@ -669,7 +682,12 @@ def _extract_kustomize(path: Path, raw_text: str) -> dict:
                         "source_file": str(path),
                     }
                 )
-    return {"nodes": nodes, "edges": edges, "k8s_candidates": []}
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "k8s_candidates": [],
+        "kustomize_candidates": candidates,
+    }
 
 
 
