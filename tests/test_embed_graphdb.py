@@ -692,6 +692,36 @@ def test_argo_node_merge_label_is_Argo(monkeypatch):
     assert "MERGE (n:Argo {id: $id})" in query
 
 
+def test_kustomize_node_merge_label_is_Kustomize(monkeypatch):
+    """A graph node with file_type='kustomize' must produce a MERGE query whose
+    label token is exactly ``Kustomize`` -- capitalized, not ``Entity``, not
+    lowercase ``kustomize``, and not stripped by the sanitizer.
+    """
+    G = nx.Graph()
+    raw_id = "kustomize://payments/kustomization"
+    G.add_node(
+        raw_id,
+        label="kustomization",
+        file_type="kustomize",
+        source_file="payments/kustomization.yaml",
+    )
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+
+    merges = [
+        (query, params)
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    ]
+    assert len(merges) == 1
+    query, params = merges[0]
+    assert params["id"] == raw_id
+    # The label token must be exactly Kustomize, never Entity or lowercase kustomize.
+    assert "MERGE (n:Kustomize {id: $id})" in query
+
+
 def test_neo4j_push_code_only_sidecar_absent_text_group(monkeypatch, tmp_path):
     """A code-only first-run sidecar -- ``code_ids``/``code_vecs``/``code_meta``
     present, NO ``text_*`` group -- must still push cleanly. The embedding
