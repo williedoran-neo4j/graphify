@@ -2217,3 +2217,24 @@ def test_resolve_kustomize_includes_ambiguous_unresolved_paths():
     ]
     for exp in expected_edges:
         assert any(e == exp for e in ambiguous), f"Missing expected edge {exp!r}"
+
+
+def test_kustomize_file_type_passes_validation():
+    """A node with file_type='kustomize' must not trigger a validation error."""
+    from graphify.validate import validate_extraction
+
+    extraction = {
+        "nodes": [
+            {
+                "id": "kustomize://base/kustomization.yaml",
+                "label": "kustomization",
+                "file_type": "kustomize",
+                "source_file": "kustomization.yaml",
+            }
+        ],
+        "edges": [],
+    }
+
+    errors = validate_extraction(extraction)
+    file_type_errors = [e for e in errors if "file_type" in e or "'kustomize'" in e]
+    assert file_type_errors == []
