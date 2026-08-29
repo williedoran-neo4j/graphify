@@ -395,6 +395,27 @@ def test_argo_file_type_passes_validation_and_survives_build():
     assert G.nodes["argo://x/WorkflowTemplate/n"]["file_type"] == "argo"
 
 
+def test_kustomize_file_type_survives_build():
+    """A node with file_type="kustomize" must retain file_type="kustomize"
+    through graph assembly, not be coerced to "concept"."""
+    from graphify.build import build_from_json
+
+    extraction = {
+        "nodes": [
+            {
+                "id": "kustomize://base/kustomization",
+                "label": "base",
+                "file_type": "kustomize",
+                "source_file": "kustomization.yaml",
+            }
+        ],
+        "edges": [],
+    }
+
+    G = build_from_json(extraction)
+    assert G.nodes["kustomize://base/kustomization"]["file_type"] == "kustomize"
+
+
 def test_extract_k8s_collects_candidates_for_references_and_service_account():
     """extract_k8s returns a k8s_candidates list with one bare dict per
     reference (envFrom, env.valueFrom, volumes) and per serviceAccountName.
