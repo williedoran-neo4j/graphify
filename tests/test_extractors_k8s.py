@@ -2259,3 +2259,36 @@ def test_kustomize_file_type_passes_validation():
     errors = validate_extraction(extraction)
     file_type_errors = [e for e in errors if "file_type" in e or "'kustomize'" in e]
     assert file_type_errors == []
+
+
+def test_extract_k8s_is_deterministic_for_kustomization(tmp_path):
+    """Two extract_k8s runs over an unchanged kustomization must produce
+    byte-identical node and edge dicts, so downstream build and push steps are
+    stable across re-runs."""
+    kustomization = tmp_path / "kustomization.yaml"
+    kustomization.write_text(
+        """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gds-api
+resources:
+  - ../base
+  - ./api
+bases:
+  - ../../shared
+components:
+  - ./components/auth
+configMapGenerator:
+  - name: gds-api-config
+    namespace: overlay
+  - name: gds-api-defaults
+secretGenerator:
+  - name: gds-api-secret
+""",
+        encoding="utf-8",
+    )
+
+    result1 = extract_k8s(kustomization)
+    result2 = extract_k8s(kustomization)
+
+    assert result1 == result2
