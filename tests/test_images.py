@@ -60,3 +60,33 @@ def test_image_ref_node_concrete_registry_references_and_rejects_placeholders():
 
     # 8. Empty string → None.
     assert image_ref_node("") is None
+
+
+def test_image_file_type_passes_validation_and_survives_build():
+    """A container-image node with file_type="image" and source_file=None must
+    pass schema validation and retain its file_type through graph assembly,
+    not be coerced to "concept"."""
+    from graphify.validate import validate_extraction
+    from graphify.build import build_from_json
+
+    extraction = {
+        "nodes": [
+            {
+                "id": "image://quay.io/keycloak/keycloak",
+                "label": "quay.io/keycloak/keycloak",
+                "file_type": "image",
+                "source_file": None,
+                "attributes": {"registry": "quay.io", "tags": []},
+            }
+        ],
+        "edges": [],
+    }
+
+    # Validation: must NOT flag "image" as an invalid file_type
+    errors = validate_extraction(extraction)
+    file_type_errors = [e for e in errors if "file_type" in e or "'image'" in e]
+    assert file_type_errors == []
+
+    # Build: file_type must survive as "image", not be coerced to "concept"
+    G = build_from_json(extraction)
+    assert G.nodes["image://quay.io/keycloak/keycloak"]["file_type"] == "image"
