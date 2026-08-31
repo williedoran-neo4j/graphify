@@ -82,6 +82,8 @@ def extract_k8s(path: Path) -> dict:
     nodes = []
     edges = []
     candidates = []
+    seen_image_ids: set = set()
+    seen_edges: set = set()
     for i, doc in enumerate(yaml.safe_load_all(raw_text)):
         metadata = doc.get("metadata") or {}
         kind = doc.get("kind", "")
@@ -148,16 +150,20 @@ def extract_k8s(path: Path) -> dict:
                 img_node = image_ref_node(image)
                 if img_node is None:
                     continue
-                nodes.append(dict(img_node))
-                edges.append(
-                    {
-                        "source": workload_id,
-                        "target": img_node["id"],
-                        "relation": "runs",
-                        "confidence": "EXTRACTED",
-                        "source_file": str(path),
-                    }
-                )
+                if img_node["id"] not in seen_image_ids:
+                    seen_image_ids.add(img_node["id"])
+                    nodes.append(dict(img_node))
+                if (workload_id, img_node["id"]) not in seen_edges:
+                    seen_edges.add((workload_id, img_node["id"]))
+                    edges.append(
+                        {
+                            "source": workload_id,
+                            "target": img_node["id"],
+                            "relation": "runs",
+                            "confidence": "EXTRACTED",
+                            "source_file": str(path),
+                        }
+                    )
     return {"nodes": nodes, "edges": edges, "k8s_candidates": candidates}
 
 

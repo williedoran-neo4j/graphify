@@ -2356,6 +2356,141 @@ spec:
         assert result["edges"] == []
 
 
+def test_extract_k8s_dedups_image_nodes_and_runs_edges_for_same_workload_same_image_path():
+    """A Deployment with two containers referencing the same registry path with
+    different tags emits only one image node and one runs edge, because the
+    tag-less image id collapses both references."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        deployment = td_path / "deployment.yaml"
+        deployment.write_text(
+            """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: repo/img:v1
+        - name: sidecar
+          image: repo/img:v2
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(deployment)
+
+        nodes = result["nodes"]
+        edges = result["edges"]
+
+        # Exactly one workload node and one image node
+        assert len(nodes) == 2
+        workload_nodes = [n for n in nodes if n["id"] == "k8s://payments/Deployment/api-server"]
+        image_nodes = [n for n in nodes if n["id"].startswith("image://")]
+        assert len(workload_nodes) == 1
+        assert len(image_nodes) == 1
+
+        image_node = image_nodes[0]
+        assert image_node == {
+            "id": "image://repo/img",
+            "label": "repo/img",
+            "file_type": "image",
+            "source_file": None,
+            "attributes": {
+                "registry": "repo",
+                "tags": ["v1"],
+            },
+        }
+
+        # Exactly one runs edge
+        assert len(edges) == 1
+        assert edges[0] == {
+            "source": "k8s://payments/Deployment/api-server",
+            "target": "image://repo/img",
+            "relation": "runs",
+            "confidence": "EXTRACTED",
+            "source_file": str(deployment),
+        }
+
+
+def test_extract_k8s_dedups_image_nodes_and_emits_one_runs_edge_per_workload():
+    """A multi-document manifest with two distinct workloads referencing the same
+    image emits one image node and two runs edges (one per workload)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        manifest = td_path / "manifest.yaml"
+        manifest.write_text(
+            """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: other/registry:tag
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: backend
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          image: other/registry:tag
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(manifest)
+
+        nodes = result["nodes"]
+        edges = result["edges"]
+
+        # Two workload nodes and one image node
+        assert len(nodes) == 3
+        workload_nodes = [n for n in nodes if n["file_type"] == "k8s"]
+        image_nodes = [n for n in nodes if n["id"].startswith("image://")]
+        assert len(workload_nodes) == 2
+        assert len(image_nodes) == 1
+        assert image_nodes[0]["id"] == "image://other/registry"
+
+        # Two runs edges, one per workload
+        assert len(edges) == 2
+        expected_edges = [
+            {
+                "source": "k8s://default/Deployment/frontend",
+                "target": "image://other/registry",
+                "relation": "runs",
+                "confidence": "EXTRACTED",
+                "source_file": str(manifest),
+            },
+            {
+                "source": "k8s://default/StatefulSet/backend",
+                "target": "image://other/registry",
+                "relation": "runs",
+                "confidence": "EXTRACTED",
+                "source_file": str(manifest),
+            },
+        ]
+        for exp in expected_edges:
+            assert any(e == exp for e in edges), f"Missing expected edge {exp!r}"
+
+
 def test_extract_k8s_is_deterministic_for_kustomization(tmp_path):
     """Two extract_k8s runs over an unchanged kustomization must produce
     byte-identical node and edge dicts, so downstream build and push steps are
