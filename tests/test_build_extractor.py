@@ -40,6 +40,8 @@ def test_extract_build_dockerfile_from_parsing(tmp_path):
         "FROM quay.io/k/registry1:v AS build\n"
         "FROM quay.io/k/registry2:v\n"
         "FROM ${BASE_IMAGE}\n"
+        "FROM --platform=linux/amd64 registry.example.com/img:v1 AS s\n"
+        "FROM ${REGISTRY}/img:v2\n"
     )
 
     result = extract_build(dockerfile)
@@ -50,31 +52,37 @@ def test_extract_build_dockerfile_from_parsing(tmp_path):
     stage0_id = f"build://{tmp_path.as_posix()}/Dockerfile/stage0"
     stage1_id = f"build://{tmp_path.as_posix()}/Dockerfile/stage1"
     stage2_id = f"build://{tmp_path.as_posix()}/Dockerfile/stage2"
+    stage3_id = f"build://{tmp_path.as_posix()}/Dockerfile/stage3"
     img0_id = "image://quay.io/keycloak/keycloak"
     img1_id = "image://quay.io/k/registry1"
     img2_id = "image://quay.io/k/registry2"
+    img3_id = "image://registry.example.com/img"
 
-    # Three stage nodes (one per concrete FROM, ARG skipped)
+    # Four stage nodes (concrete FROMs only; ${BASE_IMAGE} and ${REGISTRY}/img skipped)
     assert stage0_id in nodes
     assert stage1_id in nodes
     assert stage2_id in nodes
+    assert stage3_id in nodes
     assert nodes[stage0_id]["file_type"] == "build"
     assert nodes[stage1_id]["file_type"] == "build"
     assert nodes[stage2_id]["file_type"] == "build"
+    assert nodes[stage3_id]["file_type"] == "build"
     assert nodes[stage0_id]["source_file"] == str(dockerfile)
     assert nodes[stage1_id]["label"] == "build"  # AS alias
     assert nodes[stage2_id]["label"] == "registry2"  # image name
+    assert nodes[stage3_id]["label"] == "s"  # AS alias after --platform flag
 
-    # Three image nodes produced by image_ref_node
+    # Four image nodes produced by image_ref_node
     assert img0_id in nodes
     assert img1_id in nodes
     assert img2_id in nodes
+    assert img3_id in nodes
     assert nodes[img0_id]["file_type"] == "image"
     assert nodes[img0_id]["source_file"] is None
 
-    # Three builds edges: stage -> image
+    # Four builds edges: stage -> image
     builds_edges = [e for e in edges if e["relation"] == "builds"]
-    assert len(builds_edges) == 3
+    assert len(builds_edges) == 4
     assert all(e["confidence"] == "EXTRACTED" for e in builds_edges)
     assert all(e["source_file"] == str(dockerfile) for e in builds_edges)
 
@@ -82,3 +90,4 @@ def test_extract_build_dockerfile_from_parsing(tmp_path):
     assert (stage0_id, img0_id) in targets
     assert (stage1_id, img1_id) in targets
     assert (stage2_id, img2_id) in targets
+    assert (stage3_id, img3_id) in targets
