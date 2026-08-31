@@ -2261,6 +2261,101 @@ def test_kustomize_file_type_passes_validation():
     assert file_type_errors == []
 
 
+def test_extract_k8s_emits_image_node_and_runs_edge_for_concrete_container_image():
+    """A Deployment with a concrete container image emits an image node and a runs
+    edge from the workload to the image. The image node id is the tag-less registry
+    path, file_type is 'image', and source_file is None."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        deployment = td_path / "deployment.yaml"
+        deployment.write_text(
+            """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: europe-west1-docker.pkg.dev/aura-docker-images/aura/aura-operations-utility:806406f5-unclean
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(deployment)
+
+        nodes = result["nodes"]
+        edges = result["edges"]
+
+        # Workload node
+        workload = next(
+            n for n in nodes if n["id"] == "k8s://payments/Deployment/api-server"
+        )
+        assert workload is not None
+
+        # Image node
+        image_id = "image://europe-west1-docker.pkg.dev/aura-docker-images/aura/aura-operations-utility"
+        image_node = next((n for n in nodes if n["id"] == image_id), None)
+        assert image_node is not None
+        assert image_node == {
+            "id": image_id,
+            "label": "europe-west1-docker.pkg.dev/aura-docker-images/aura/aura-operations-utility",
+            "file_type": "image",
+            "source_file": None,
+            "attributes": {
+                "registry": "europe-west1-docker.pkg.dev",
+                "tags": ["806406f5-unclean"],
+            },
+        }
+
+        # Exactly one runs edge
+        assert len(edges) == 1
+        assert edges[0] == {
+            "source": "k8s://payments/Deployment/api-server",
+            "target": image_id,
+            "relation": "runs",
+            "confidence": "EXTRACTED",
+            "source_file": str(deployment),
+        }
+
+
+def test_extract_k8s_skips_placeholder_image_and_emits_no_runs_edge():
+    """A Pod with a placeholder image value (_IMAGE) is skipped: no image node and
+    no runs edge are emitted, and edges remains empty."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        pod = td_path / "pod.yaml"
+        pod.write_text(
+            """\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker
+  namespace: jobs
+spec:
+  containers:
+    - name: main
+      image: _IMAGE
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(pod)
+
+        # No image node should exist
+        assert all(not n["id"].startswith("image://") for n in result["nodes"])
+
+        # edges must stay empty
+        assert result["edges"] == []
+
+
 def test_extract_k8s_is_deterministic_for_kustomization(tmp_path):
     """Two extract_k8s runs over an unchanged kustomization must produce
     byte-identical node and edge dicts, so downstream build and push steps are

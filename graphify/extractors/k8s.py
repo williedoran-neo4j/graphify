@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from graphify.extractors.images import image_ref_node
+
 
 class Dialect(Enum):
     K8S_MANIFEST = auto()
@@ -78,6 +80,7 @@ def extract_k8s(path: Path) -> dict:
     if dialect is not Dialect.K8S_MANIFEST:
         return {"nodes": [], "edges": [], "k8s_candidates": []}
     nodes = []
+    edges = []
     candidates = []
     for i, doc in enumerate(yaml.safe_load_all(raw_text)):
         metadata = doc.get("metadata") or {}
@@ -109,9 +112,10 @@ def extract_k8s(path: Path) -> dict:
                     labels = bare_labels
         if labels is not None:
             attributes["labels"] = labels
+        workload_id = f"k8s://{namespace}/{kind}/{name}"
         nodes.append(
             {
-                "id": f"k8s://{namespace}/{kind}/{name}",
+                "id": workload_id,
                 "label": f"{kind}/{name}",
                 "file_type": "k8s",
                 "source_file": str(path),
@@ -126,7 +130,35 @@ def extract_k8s(path: Path) -> dict:
             "source_name": name,
         }
         candidates.extend(_candidates(doc, base))
-    return {"nodes": nodes, "edges": [], "k8s_candidates": candidates}
+        container_list = None
+        spec = doc.get("spec")
+        if isinstance(spec, dict):
+            template = spec.get("template")
+            if isinstance(template, dict) and isinstance(template.get("spec"), dict):
+                container_list = template["spec"].get("containers")
+            elif isinstance(spec.get("containers"), list):
+                container_list = spec["containers"]
+        if isinstance(container_list, list):
+            for container in container_list:
+                if not isinstance(container, dict):
+                    continue
+                image = container.get("image")
+                if not isinstance(image, str):
+                    continue
+                img_node = image_ref_node(image)
+                if img_node is None:
+                    continue
+                nodes.append(dict(img_node))
+                edges.append(
+                    {
+                        "source": workload_id,
+                        "target": img_node["id"],
+                        "relation": "runs",
+                        "confidence": "EXTRACTED",
+                        "source_file": str(path),
+                    }
+                )
+    return {"nodes": nodes, "edges": edges, "k8s_candidates": candidates}
 
 
 def _pod_spec(doc: dict) -> dict | None:
