@@ -175,3 +175,59 @@ def test_extract_build_makefile_targets_and_builds_edges(tmp_path):
     assert builds_edges_mk[0]["target"] == image_id_mk
     assert builds_edges_mk[0]["confidence"] == "EXTRACTED"
     assert builds_edges_mk[0]["source_file"] == str(mkfile)
+
+
+def test_extract_build_makefile_inline_prerequisites(tmp_path):
+    """A Makefile rule in the canonical 'target: prereq ...' form (prerequisites
+    on the same line, no trailing colon) must still yield a build node for the
+    target and a builds edge when its recipe names a concrete image.
+    Prerequisites themselves must NOT become nodes.  Colon-containing lines
+    that are not targets (:= assignments, ifeq conditionals) must also produce NO
+    node."""
+    from graphify.extractors.build import extract_build
+
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "build: deps\n"
+        "\tdocker build . -t europe-west1-docker.pkg.dev/x/y:tag\n"
+        "\n"
+        "VAR := x\n"
+        "ifeq ($(X),y)\n"
+        "\techo ok\n"
+        "endif\n"
+    )
+
+    result = extract_build(makefile)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = result["edges"]
+
+    dir_path = tmp_path.as_posix()
+    build_id = f"makefile://{dir_path}/build"
+    deps_id = f"makefile://{dir_path}/deps"
+    image_id = "image://europe-west1-docker.pkg.dev/x/y"
+
+    # Exactly one build node for the target 'build', NOT for 'deps'
+    assert build_id in nodes, f"expected node {build_id} in {list(nodes.keys())}"
+    assert nodes[build_id]["label"] == "build"
+    assert nodes[build_id]["file_type"] == "build"
+    assert nodes[build_id]["source_file"] == str(makefile)
+    assert deps_id not in nodes, f"prerequisite 'deps' must not become a node"
+
+    # One image node
+    assert image_id in nodes
+    assert nodes[image_id]["file_type"] == "image"
+    assert nodes[image_id]["source_file"] is None
+
+    # One builds edge from target to image
+    builds_edges = [e for e in edges if e["relation"] == "builds"]
+    assert len(builds_edges) == 1
+    assert builds_edges[0]["source"] == build_id
+    assert builds_edges[0]["target"] == image_id
+    assert builds_edges[0]["confidence"] == "EXTRACTED"
+    assert builds_edges[0]["source_file"] == str(makefile)
+
+    # No nodes for := assignment or ifeq conditional lines
+    var_node = f"makefile://{dir_path}/VAR"
+    ifeq_node = f"makefile://{dir_path}/ifeq"
+    assert var_node not in nodes
+    assert ifeq_node not in nodes

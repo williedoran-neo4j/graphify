@@ -64,8 +64,8 @@ def _extract_makefile(path: Path) -> dict:
             if cur_target_id is not None:
                 recipe_tokens.extend(shlex.split(stripped))
             continue
-        if stripped.endswith(":"):
-            name = stripped[:-1].strip()
+        if ":" in stripped and not stripped.partition(":")[2].startswith(("=", "?", ":")):
+            name = stripped.split(":", 1)[0].strip()
             flush()
             # skip Makefile directives (.PHONY etc.) and file inclusions
             if not name or name == "include" or name.startswith("."):
