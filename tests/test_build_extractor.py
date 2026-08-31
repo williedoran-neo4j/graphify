@@ -231,3 +231,43 @@ def test_extract_build_makefile_inline_prerequisites(tmp_path):
     ifeq_node = f"makefile://{dir_path}/ifeq"
     assert var_node not in nodes
     assert ifeq_node not in nodes
+
+
+def test_extract_build_makefile_image_without_tag_flag(tmp_path):
+    """A Makefile target whose recipe references a concrete image without a
+    leading -t or --tag flag (e.g. docker push) still emits a builds edge to
+    that image via the fallback token loop."""
+    from graphify.extractors.build import extract_build
+
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "push-image:\n"
+        "\tdocker push europe-west1-docker.pkg.dev/x/y:tag\n"
+    )
+
+    result = extract_build(makefile)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = result["edges"]
+
+    dir_path = tmp_path.as_posix()
+    target_id = f"makefile://{dir_path}/push-image"
+    image_id = "image://europe-west1-docker.pkg.dev/x/y"
+
+    # One build node for the target
+    assert target_id in nodes
+    assert nodes[target_id]["label"] == "push-image"
+    assert nodes[target_id]["file_type"] == "build"
+    assert nodes[target_id]["source_file"] == str(makefile)
+
+    # One image node
+    assert image_id in nodes
+    assert nodes[image_id]["file_type"] == "image"
+    assert nodes[image_id]["source_file"] is None
+
+    # One builds edge from target to image (found by fallback, not -t/--tag)
+    builds_edges = [e for e in edges if e["relation"] == "builds"]
+    assert len(builds_edges) == 1
+    assert builds_edges[0]["source"] == target_id
+    assert builds_edges[0]["target"] == image_id
+    assert builds_edges[0]["confidence"] == "EXTRACTED"
+    assert builds_edges[0]["source_file"] == str(makefile)
