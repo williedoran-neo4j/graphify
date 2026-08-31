@@ -46,6 +46,7 @@ from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
+from graphify.extractors.build import extract_build  # noqa: F401
 from graphify.extractors.k8s import (
     _resolve_argo_references,
     _resolve_k8s_references,
@@ -5261,6 +5262,7 @@ _DISPATCH: dict[str, Any] = {
     ".json": extract_json,
     ".yaml": extract_k8s,
     ".yml": extract_k8s,
+    ".mk": extract_build,
     ".tf": extract_terraform,
     ".tfvars": extract_terraform,
     ".hcl": extract_terraform,
@@ -5445,6 +5447,9 @@ def _get_extractor(path: Path) -> Any | None:
     # Without this, detect labels e.g. `#!/usr/bin/env bash` CLIs as code but
     # extraction returns no extractor and the file silently contributes nothing.
     if not suffix:
+        # Extensionless Makefile/Dockerfile (no shebang) are build files.
+        if path.name.lower() in ("makefile", "dockerfile"):
+            return extract_build
         from graphify.detect import _shebang_interpreter
         interp = _shebang_interpreter(path)
         if interp is not None:

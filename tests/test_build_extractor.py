@@ -1,3 +1,25 @@
+def test_get_extractor_routes_makefile_dockerfile_mk_to_extract_build(tmp_path):
+    """_get_extractor must return the extract_build callable for extensionless
+    Makefile and Dockerfile, and for any .mk file, while still routing .py to
+    the Python extractor."""
+    from graphify.extract import _get_extractor
+    from graphify.extractors.build import extract_build
+
+    makefile = tmp_path / "Makefile"
+    makefile.write_text("build:\n")
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
+    mkfile = tmp_path / "foo.mk"
+    mkfile.write_text("build:\n")
+    pyfile = tmp_path / "app.py"
+    pyfile.write_text("x = 1\n")
+
+    assert _get_extractor(makefile) is extract_build
+    assert _get_extractor(dockerfile) is extract_build
+    assert _get_extractor(mkfile) is extract_build
+    assert _get_extractor(pyfile) is not extract_build
+
+
 def test_build_file_type_passes_validation_and_survives_build():
     """A build node with file_type='build' must pass schema validation and
     retain its file_type through graph assembly, not be coerced to 'concept'."""
