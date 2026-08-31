@@ -91,3 +91,87 @@ def test_extract_build_dockerfile_from_parsing(tmp_path):
     assert (stage1_id, img1_id) in targets
     assert (stage2_id, img2_id) in targets
     assert (stage3_id, img3_id) in targets
+
+
+def test_extract_build_makefile_targets_and_builds_edges(tmp_path):
+    """extract_build on a Makefile or .mk emits one build node per named target,
+    and a builds edge (EXTRACTED) when the target's recipe names a concrete
+    image. Bare targets get a node but no edge. Image nodes are deduped by id."""
+    from graphify.extractors.build import extract_build
+
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "build-image:\n"
+        "\tdocker build . -t europe-west1-docker.pkg.dev/x/y:tag\n"
+        "\n"
+        "lint:\n"
+        "\tflake8 .\n"
+    )
+
+    mkfile = tmp_path / "foo.mk"
+    mkfile.write_text(
+        "build:\n"
+        "\tdocker build . -t quay.io/k/img:latest\n"
+    )
+
+    # --- Makefile ---
+    result = extract_build(makefile)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = result["edges"]
+
+    dir_path = tmp_path.as_posix()
+    build_img_id = f"makefile://{dir_path}/build-image"
+    lint_id = f"makefile://{dir_path}/lint"
+    image_id = "image://europe-west1-docker.pkg.dev/x/y"
+
+    # Two build nodes
+    assert build_img_id in nodes
+    assert lint_id in nodes
+    assert nodes[build_img_id]["label"] == "build-image"
+    assert nodes[build_img_id]["file_type"] == "build"
+    assert nodes[build_img_id]["source_file"] == str(makefile)
+    assert nodes[lint_id]["label"] == "lint"
+    assert nodes[lint_id]["file_type"] == "build"
+    assert nodes[lint_id]["source_file"] == str(makefile)
+    assert nodes[build_img_id]["attributes"] == {}
+    assert nodes[lint_id]["attributes"] == {}
+
+    # One image node (deduped, source_file=None)
+    assert image_id in nodes
+    assert nodes[image_id]["file_type"] == "image"
+    assert nodes[image_id]["source_file"] is None
+
+    # One builds edge from the target that names an image
+    builds_edges = [e for e in edges if e["relation"] == "builds"]
+    assert len(builds_edges) == 1
+    assert builds_edges[0]["source"] == build_img_id
+    assert builds_edges[0]["target"] == image_id
+    assert builds_edges[0]["confidence"] == "EXTRACTED"
+    assert builds_edges[0]["source_file"] == str(makefile)
+
+    # --- .mk file ---
+    result_mk = extract_build(mkfile)
+    nodes_mk = {n["id"]: n for n in result_mk["nodes"]}
+    edges_mk = result_mk["edges"]
+
+    build_id = f"makefile://{dir_path}/build"
+    image_id_mk = "image://quay.io/k/img"
+
+    # One build node
+    assert build_id in nodes_mk
+    assert nodes_mk[build_id]["label"] == "build"
+    assert nodes_mk[build_id]["file_type"] == "build"
+    assert nodes_mk[build_id]["source_file"] == str(mkfile)
+
+    # One image node
+    assert image_id_mk in nodes_mk
+    assert nodes_mk[image_id_mk]["file_type"] == "image"
+    assert nodes_mk[image_id_mk]["source_file"] is None
+
+    # One builds edge
+    builds_edges_mk = [e for e in edges_mk if e["relation"] == "builds"]
+    assert len(builds_edges_mk) == 1
+    assert builds_edges_mk[0]["source"] == build_id
+    assert builds_edges_mk[0]["target"] == image_id_mk
+    assert builds_edges_mk[0]["confidence"] == "EXTRACTED"
+    assert builds_edges_mk[0]["source_file"] == str(mkfile)
