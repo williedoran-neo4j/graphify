@@ -837,11 +837,13 @@ def _extract_ci(path: Path, raw_text: str) -> dict:
     """Extract one node per top-level jobs.<key> in a CI workflow document.
 
     Docker build/push steps also emit image nodes and publishes edges from
-    the job node to each image the step produces.
+    the job node to each image the step produces; every step with a uses:
+    ref additionally emits an action node and a references edge to it.
     """
     nodes = []
     edges = []
     seen_image_ids: set = set()
+    seen_action_refs: set = set()
     seen_edges: set = set()
     dirname = path.parent.as_posix()
     for doc in yaml.safe_load_all(raw_text):
@@ -874,6 +876,30 @@ def _extract_ci(path: Path, raw_text: str) -> dict:
                 candidates = []
                 uses = step.get("uses")
                 run = step.get("run")
+                if isinstance(uses, str) and uses:
+                    action_id = f"ci://{dirname}/_action/{uses}"
+                    if uses not in seen_action_refs:
+                        seen_action_refs.add(uses)
+                        nodes.append(
+                            {
+                                "id": action_id,
+                                "label": uses,
+                                "file_type": "ci",
+                                "source_file": str(path),
+                                "source_location": "doc0",
+                            }
+                        )
+                    if (job_id, action_id) not in seen_edges:
+                        seen_edges.add((job_id, action_id))
+                        edges.append(
+                            {
+                                "source": job_id,
+                                "target": action_id,
+                                "relation": "references",
+                                "confidence": "EXTRACTED",
+                                "source_file": str(path),
+                            }
+                        )
                 if isinstance(uses, str) and uses.startswith(
                     "docker/build-push-action"
                 ):

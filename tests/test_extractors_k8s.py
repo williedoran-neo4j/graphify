@@ -2582,8 +2582,8 @@ secretGenerator:
 def test_extract_k8s_routes_ci_workflow_to_extract_ci_and_emits_job_nodes(tmp_path):
     """A GitHub Actions workflow with two jobs is routed through _extract_ci,
     emitting one node per job with file_type='ci', label set to the job key,
-    and a ci:// id that is stable and /-joined. No edges or ci_candidates are
-    emitted at pass 1."""
+    and a ci:// id that is stable and /-joined. Action nodes and references
+    edges are also emitted for each uses: step."""
     workflow = tmp_path / "workflow.yaml"
     workflow.write_text(
         """\
@@ -2606,12 +2606,16 @@ jobs:
 
     nodes = result["nodes"]
     edges = result["edges"]
-    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
-    assert edges == []
+    # 2 job nodes + 1 deduped action node for actions/checkout@v4
+    assert len(nodes) == 3, f"Expected 3 nodes, got {len(nodes)}: {nodes!r}"
+    # 2 references edges (one per job → the shared action node)
+    assert len(edges) == 2, f"Expected 2 edges, got {len(edges)}: {edges!r}"
+    assert all(e["relation"] == "references" for e in edges)
     assert "ci_candidates" not in result or result.get("ci_candidates", []) == []
 
-    labels = {n["label"] for n in nodes}
-    assert labels == {"build", "deploy"}
+    job_nodes = [n for n in nodes if "/_action/" not in n["id"]]
+    job_labels = {n["label"] for n in job_nodes}
+    assert job_labels == {"build", "deploy"}
 
     for n in nodes:
         assert n["file_type"] == "ci"
@@ -2645,7 +2649,7 @@ jobs: just-a-string
 def test_extract_ci_skips_non_dict_job_entries(tmp_path):
     """A CI workflow whose jobs dict contains a non-dict entry (e.g. a scalar
     string) yields no node for that entry. Only dict-valued job entries emit
-    nodes, and edges remain empty."""
+    nodes; action nodes and references edges are still emitted for uses steps."""
     workflow = tmp_path / "workflow.yaml"
     workflow.write_text(
         """\
@@ -2666,22 +2670,27 @@ jobs:
     nodes = result["nodes"]
     edges = result["edges"]
 
-    assert len(nodes) == 1, f"Expected 1 node, got {len(nodes)}: {nodes!r}"
-    assert edges == []
+    # 1 job node + 1 action node for actions/checkout@v4
+    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
+    # 1 references edge from the job to the action node
+    assert len(edges) == 1, f"Expected 1 edge, got {len(edges)}: {edges!r}"
+    assert edges[0]["relation"] == "references"
 
-    labels = {n["label"] for n in nodes}
-    assert labels == {"build"}
+    job_nodes = [n for n in nodes if "/_action/" not in n["id"]]
+    job_labels = {n["label"] for n in job_nodes}
+    assert job_labels == {"build"}
+    assert "bad" not in job_labels
 
-    node = nodes[0]
+    node = job_nodes[0]
     assert node["label"] == "build"
     assert node["file_type"] == "ci"
 
 
 def test_extract_ci_emits_publishes_edge_for_docker_build_push_action_step(tmp_path):
     """A CI workflow with a docker/build-push-action step that names a concrete
-    registry image emits a ci job node, an image node (tag stripped), and a single
-    publishes edge. The preceding actions/checkout step must NOT become an image
-    node because action refs are not docker images."""
+    registry image emits a ci job node, an image node (tag stripped), and a
+    publishes edge. Action nodes and references edges are also emitted for each
+    uses: step. The preceding actions/checkout step must NOT become an image node."""
     workflow = tmp_path / "workflow.yaml"
     workflow.write_text(
         """\
@@ -2704,16 +2713,16 @@ jobs:
     nodes = result["nodes"]
     edges = result["edges"]
 
-    # Exactly 2 nodes: 1 CI job + 1 image
-    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
+    # 1 CI job + 2 action nodes (checkout, build-push-action) + 1 image = 4
+    assert len(nodes) == 4, f"Expected 4 nodes, got {len(nodes)}: {nodes!r}"
 
-    ci_nodes = [n for n in nodes if n["file_type"] == "ci"]
+    job_nodes = [n for n in nodes if n["file_type"] == "ci" and "/_action/" not in n["id"]]
     image_nodes = [n for n in nodes if n["file_type"] == "image"]
 
-    assert len(ci_nodes) == 1
+    assert len(job_nodes) == 1
     assert len(image_nodes) == 1
 
-    ci_node = ci_nodes[0]
+    ci_node = job_nodes[0]
     assert ci_node["label"] == "build"
     assert ci_node["id"].startswith("ci://")
 
@@ -2725,9 +2734,13 @@ jobs:
     assert image_node["attributes"]["registry"] == "ghcr.io"
     assert image_node["attributes"]["tags"] == ["latest"]
 
-    # Exactly 1 publishes edge
-    assert len(edges) == 1, f"Expected 1 edge, got {len(edges)}: {edges!r}"
-    assert edges[0] == {
+    # 1 publishes edge + 2 references edges = 3
+    assert len(edges) == 3, f"Expected 3 edges, got {len(edges)}: {edges!r}"
+    pub_edges = [e for e in edges if e["relation"] == "publishes"]
+    ref_edges = [e for e in edges if e["relation"] == "references"]
+    assert len(pub_edges) == 1
+    assert len(ref_edges) == 2
+    assert pub_edges[0] == {
         "source": ci_node["id"],
         "target": "image://ghcr.io/org/app",
         "relation": "publishes",
@@ -2741,8 +2754,9 @@ jobs:
 
 def test_extract_ci_skips_placeholder_image_in_docker_build_push_action(tmp_path):
     """A CI workflow whose docker/build-push-action step uses a ${{ vars.X }}
-    placeholder image produces only the CI job node and zero image nodes or edges,
-    because placeholders must never become image nodes."""
+    placeholder image produces no image node and no publishes edge, because
+    placeholders must never become image nodes. The action node and references
+    edge for the build-push-action step are still emitted."""
     workflow = tmp_path / "workflow.yaml"
     workflow.write_text(
         """\
@@ -2764,13 +2778,18 @@ jobs:
     nodes = result["nodes"]
     edges = result["edges"]
 
-    # Only the CI job node; no image node, no edge
-    assert len(nodes) == 1, f"Expected 1 node, got {len(nodes)}: {nodes!r}"
-    assert nodes[0]["file_type"] == "ci"
-    assert nodes[0]["label"] == "build"
-
-    assert len(edges) == 0, f"Expected 0 edges, got {len(edges)}: {edges!r}"
+    # 1 job node + 1 action node for docker/build-push-action@v5
+    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
     assert all(n["file_type"] != "image" for n in nodes)
+
+    job_nodes = [n for n in nodes if "/_action/" not in n["id"]]
+    assert len(job_nodes) == 1
+    assert job_nodes[0]["label"] == "build"
+    assert job_nodes[0]["file_type"] == "ci"
+
+    # No publishes edge; exactly 1 references edge from the job to the action node
+    assert len(edges) == 1, f"Expected 1 edge, got {len(edges)}: {edges!r}"
+    assert edges[0]["relation"] == "references"
 
 
 def test_extract_ci_emits_publishes_edge_for_run_docker_build(tmp_path):
@@ -2828,7 +2847,8 @@ jobs:
 def test_extract_ci_restricts_build_push_action_to_tags_only(tmp_path):
     """A docker/build-push-action step must emit image nodes only for the image
     declared in tags (or image-position fields), never for context, file, push,
-    labels, build-args, or cache-from values."""
+    labels, build-args, or cache-from values. Action nodes and references edges
+    are still emitted for the uses: step."""
     workflow = tmp_path / "workflow.yaml"
     workflow.write_text(
         """\
@@ -2854,13 +2874,18 @@ jobs:
     image_nodes = [n for n in nodes if n["file_type"] == "image"]
     image_ids = {n["id"] for n in image_nodes}
 
+    # Only the concrete image from tags becomes an image node; no image from context/file
     assert image_ids == {"image://ghcr.io/org/app"}, (
         f"Expected exactly one image node, got {image_ids}"
     )
 
-    assert len(edges) == 1
-    assert edges[0]["target"] == "image://ghcr.io/org/app"
-    assert edges[0]["relation"] == "publishes"
+    # 1 publishes edge + 1 references edge from the action node = 2
+    assert len(edges) == 2
+    pub_edges = [e for e in edges if e["relation"] == "publishes"]
+    ref_edges = [e for e in edges if e["relation"] == "references"]
+    assert len(pub_edges) == 1
+    assert len(ref_edges) == 1
+    assert pub_edges[0]["target"] == "image://ghcr.io/org/app"
 
 
 def test_extract_ci_skips_placeholder_image_in_run_docker_build(tmp_path):
@@ -2926,7 +2951,8 @@ jobs:
 
 
 def test_extract_ci_plain_actions_checkout_no_image(tmp_path):
-    """A plain 'uses: actions/checkout@v4' step must never produce an image node."""
+    """A plain 'uses: actions/checkout@v4' step must never produce an image node.
+    It does produce an action node and a references edge."""
     workflow = tmp_path / "workflow.yaml"
     workflow.write_text(
         """\
@@ -2943,10 +2969,153 @@ jobs:
 
     result = extract_k8s(workflow)
     nodes = result["nodes"]
+    edges = result["edges"]
 
     image_nodes = [n for n in nodes if n["file_type"] == "image"]
     assert len(image_nodes) == 0, (
         f"Expected 0 image nodes, got {len(image_nodes)}: {[n['id'] for n in image_nodes]}"
     )
-    assert len(nodes) == 1
-    assert nodes[0]["file_type"] == "ci"
+
+    # 1 job node + 1 action node for actions/checkout@v4
+    assert len(nodes) == 2
+    job_nodes = [n for n in nodes if "/_action/" not in n["id"]]
+    assert len(job_nodes) == 1
+    assert job_nodes[0]["file_type"] == "ci"
+
+    # 1 references edge, no publishes edge
+    assert len(edges) == 1
+    assert edges[0]["relation"] == "references"
+
+
+def test_extract_ci_emits_references_edges_and_action_nodes_for_uses_steps(tmp_path):
+    """A CI workflow emits a references edge from each job node to every
+    distinct uses: action ref, plus a deduplicated ci-typed action node per
+    distinct ref. Action nodes carry the uses: ref verbatim as their label,
+    have a stable /-joined ci:// id without repo identity, and are distinct
+    from image nodes. A docker/build-push-action step emits both a references
+    edge and a publishes edge plus image node."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  checkout-a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+  checkout-b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+  setup-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+      - uses: docker/build-push-action@v5
+        with:
+          tags: ghcr.io/org/app:latest
+  local-action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ././github/actions/foo
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    # Separate node types: ci job nodes vs ci action nodes vs image nodes
+    ci_nodes = [n for n in nodes if n.get("file_type") == "ci"]
+    job_nodes = [n for n in ci_nodes if "/_action/" not in n["id"]]
+    action_nodes = [n for n in ci_nodes if "/_action/" in n["id"]]
+    image_nodes = [n for n in nodes if n.get("file_type") == "image"]
+
+    # Four distinct job nodes
+    assert len(job_nodes) == 4
+    job_labels = {n["label"] for n in job_nodes}
+    assert job_labels == {"checkout-a", "checkout-b", "setup-and-build", "local-action"}
+    job_ids = {n["id"] for n in job_nodes}
+
+    # Action nodes: deduplicated by ref across the whole file
+    assert len(action_nodes) == 4
+    action_labels = {n["label"] for n in action_nodes}
+    assert action_labels == {
+        "actions/checkout@v4",
+        "actions/setup-node@v4",
+        "docker/build-push-action@v5",
+        "././github/actions/foo",
+    }
+    action_ids = {n["id"] for n in action_nodes}
+
+    # Structural assertions: stable /-joined ci:// id, no repo identity, label verbatim
+    dirname = tmp_path.as_posix()
+    for n in action_nodes:
+        assert n["label"] in n["id"]
+        assert n["id"].startswith(f"ci://{dirname}/_action/")
+        assert n["file_type"] == "ci"
+        assert n["source_file"] == str(workflow)
+
+    # Exactly one image node from the docker/build-push-action step
+    assert len(image_nodes) == 1
+    assert image_nodes[0]["id"] == "image://ghcr.io/org/app"
+
+    # Total nodes = 4 jobs + 4 action targets + 1 image = 9
+    assert len(nodes) == 9
+
+    # Edge separation
+    ref_edges = [e for e in edges if e.get("relation") == "references"]
+    pub_edges = [e for e in edges if e.get("relation") == "publishes"]
+
+    # Five references edges: two checkout jobs share one action node,
+    # plus setup-node, build-push-action, and local action
+    assert len(ref_edges) == 5
+
+    # One publishes edge for the concrete image
+    assert len(pub_edges) == 1
+    assert pub_edges[0]["target"] == "image://ghcr.io/org/app"
+
+    # Every references edge resolves to a real emitted action node
+    for e in ref_edges:
+        assert e["confidence"] == "EXTRACTED"
+        assert e["source_file"] == str(workflow)
+        assert e["source"] in job_ids
+        assert e["target"] in action_ids
+
+    # Verify specific job -> action pairs
+    checkout_a_id = next(n["id"] for n in job_nodes if n["label"] == "checkout-a")
+    checkout_b_id = next(n["id"] for n in job_nodes if n["label"] == "checkout-b")
+    setup_build_id = next(n["id"] for n in job_nodes if n["label"] == "setup-and-build")
+    local_action_id = next(n["id"] for n in job_nodes if n["label"] == "local-action")
+
+    checkout_action_id = next(
+        n["id"] for n in action_nodes if n["label"] == "actions/checkout@v4"
+    )
+    setup_action_id = next(
+        n["id"] for n in action_nodes if n["label"] == "actions/setup-node@v4"
+    )
+    build_action_id = next(
+        n["id"] for n in action_nodes if n["label"] == "docker/build-push-action@v5"
+    )
+    local_action_action_id = next(
+        n["id"] for n in action_nodes if n["label"] == "././github/actions/foo"
+    )
+
+    ref_pairs = {(e["source"], e["target"]) for e in ref_edges}
+    assert (checkout_a_id, checkout_action_id) in ref_pairs
+    assert (checkout_b_id, checkout_action_id) in ref_pairs
+    assert (setup_build_id, setup_action_id) in ref_pairs
+    assert (setup_build_id, build_action_id) in ref_pairs
+    assert (local_action_id, local_action_action_id) in ref_pairs
+
+    # The build-push job emits both relations (two references + one publishes)
+    setup_build_edges = [e for e in edges if e["source"] == setup_build_id]
+    assert len(setup_build_edges) == 3
+    assert {e["relation"] for e in setup_build_edges} == {"publishes", "references"}
+
+    # Each of the single-step jobs emits exactly one references edge
+    assert len([e for e in edges if e["source"] == checkout_a_id]) == 1
+    assert len([e for e in edges if e["source"] == checkout_b_id]) == 1
+    assert len([e for e in edges if e["source"] == local_action_id]) == 1
