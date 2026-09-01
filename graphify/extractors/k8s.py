@@ -10,6 +10,34 @@ import yaml
 
 from graphify.extractors.images import image_ref_node
 
+# Built-in k8s API groups that are NOT custom-resource groups. A resource whose
+# apiVersion group is one of these (or ends in .k8s.io) is core infrastructure,
+# never a CR that names a CRD.
+_K8S_CORE_GROUPS = frozenset(
+    {
+        "apps",
+        "batch",
+        "autoscaling",
+        "policy",
+        "extensions",
+        "networking",
+        "storage",
+        "scheduling",
+        "admissionregistration",
+        "apiextensions",
+        "apiregistration",
+        "authentication",
+        "authorization",
+        "certificates",
+        "coordination",
+        "discovery",
+        "events",
+        "flowcontrol",
+        "node",
+        "rbac",
+    }
+)
+
 
 class Dialect(Enum):
     K8S_MANIFEST = auto()
@@ -104,6 +132,24 @@ def extract_k8s(path: Path) -> dict:
         name = metadata.get("name", "")
         namespace = metadata.get("namespace") or "_cluster"
         attributes = {"kind": kind, "namespace": namespace}
+        # CRD group+kind and CR apiVersion group power the CRD→CR `defines` link
+        # (R7-S2): a CR's apiVersion group matches the CRD's spec.group, and its
+        # kind matches the CRD's spec.names.kind.
+        api_version = doc.get("apiVersion")
+        doc_spec = doc.get("spec")
+        if kind == "CustomResourceDefinition" and isinstance(doc_spec, dict):
+            if isinstance(doc_spec.get("group"), str):
+                attributes["crd_group"] = doc_spec["group"]
+            names = doc_spec.get("names")
+            if isinstance(names, dict) and isinstance(names.get("kind"), str):
+                attributes["crd_kind"] = names["kind"]
+        elif isinstance(api_version, str) and "/" in api_version:
+            group = api_version.split("/", 1)[0]
+            # Stamp only CUSTOM resources (CRs). Built-in groups (apps, batch,
+            # *.k8s.io, autoscaling, policy, extensions) are not CRs and never
+            # name a CRD, so leaving them unstamped avoids attribute churn.
+            if group and not group.endswith(".k8s.io") and group not in _K8S_CORE_GROUPS:
+                attributes["api_group"] = group
         containers = _container_names(doc)
         if containers:
             attributes["containers"] = containers
@@ -705,6 +751,34 @@ def _resolve_k8s_references(
                         "source_file": svc["source_file"],
                     }
                 )
+    # CRD→CR `defines` pass: a CustomResource instance's apiVersion group + kind
+    # names the CRD that defines its schema (R7-S2). Index CRDs by (group, kind)
+    # and link every matching CR. Exact match, so EXTRACTED; no node fabricated —
+    # a CR whose CRD is absent (lives in another repo/file) is simply unlinked.
+    crds_by_kind: dict[tuple[str, str], dict] = {}
+    crs: list[dict] = []
+    for node in all_nodes:
+        attributes = node.get("attributes") or {}
+        if attributes.get("crd_group") and attributes.get("crd_kind"):
+            crds_by_kind[(attributes["crd_group"], attributes["crd_kind"])] = node
+        elif attributes.get("api_group") and attributes.get("kind"):
+            crs.append(node)
+    seen_defines: set[tuple[str, str]] = set()
+    for cr in crs:
+        attributes = cr.get("attributes") or {}
+        crd = crds_by_kind.get((attributes["api_group"], attributes["kind"]))
+        if crd is None or (crd["id"], cr["id"]) in seen_defines:
+            continue
+        seen_defines.add((crd["id"], cr["id"]))
+        all_edges.append(
+            {
+                "source": crd["id"],
+                "target": cr["id"],
+                "relation": "defines",
+                "confidence": "EXTRACTED",
+                "source_file": crd["source_file"],
+            }
+        )
 
 
 def _resolve_kustomize_includes(

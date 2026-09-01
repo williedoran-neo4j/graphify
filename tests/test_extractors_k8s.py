@@ -387,6 +387,7 @@ jobs:
         assert cu["attributes"] == {
             "kind": "MyCustomResource",
             "namespace": "custom-ns",
+            "api_group": "example.com",  # CR apiVersion group (R7-S2)
         }
         assert "containers" not in cu["attributes"]
         assert result_custom["edges"] == []
@@ -1327,6 +1328,64 @@ spec:
     result = extract_k8s(mgmt)
     routes = [e for e in result["edges"] if e.get("relation") == "routes"]
     assert routes == []
+
+
+def test_resolve_k8s_references_emits_defines_edge_from_crd_to_cr():
+    """R7-S2 — a CustomResourceDefinition whose spec.group + spec.names.kind match a
+    CustomResource's apiVersion group + kind emits a `defines` edge (EXTRACTED) from
+    the CRD to the CR. A CR whose group has no matching CRD emits nothing."""
+    crd_source = "neo4j.io_neo4jdatabases.yaml"
+    cr_source = "db.yaml"
+    all_nodes = [
+        {
+            "id": "k8s://_cluster/CustomResourceDefinition/neo4jdatabases.neo4j.io",
+            "label": "CustomResourceDefinition/neo4jdatabases.neo4j.io",
+            "file_type": "k8s",
+            "source_file": crd_source,
+            "attributes": {
+                "kind": "CustomResourceDefinition",
+                "namespace": "_cluster",
+                "crd_group": "neo4j.io",
+                "crd_kind": "Neo4jDatabase",
+            },
+        },
+        {
+            "id": "k8s://default/Neo4jDatabase/my-db",
+            "label": "Neo4jDatabase/my-db",
+            "file_type": "k8s",
+            "source_file": cr_source,
+            "attributes": {
+                "kind": "Neo4jDatabase",
+                "namespace": "default",
+                "api_group": "neo4j.io",
+            },
+        },
+        # A CR whose apiVersion group has no CRD → no defines edge.
+        {
+            "id": "k8s://default/ExternalThing/x",
+            "label": "ExternalThing/x",
+            "file_type": "k8s",
+            "source_file": cr_source,
+            "attributes": {
+                "kind": "ExternalThing",
+                "namespace": "default",
+                "api_group": "vendor.example.com",
+            },
+        },
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references([], all_nodes, all_edges)
+
+    defines = [e for e in all_edges if e.get("relation") == "defines"]
+    assert len(defines) == 1, f"Expected 1 defines edge, got {defines}"
+
+    edge = defines[0]
+    assert edge["source"] == "k8s://_cluster/CustomResourceDefinition/neo4jdatabases.neo4j.io"
+    assert edge["target"] == "k8s://default/Neo4jDatabase/my-db"
+    assert edge["relation"] == "defines"
+    assert edge["confidence"] == "EXTRACTED"
+    assert edge["source_file"] == crd_source
 
 
 def test_extract_k8s_emits_argo_workflow_and_template_nodes_for_workflow_template():
