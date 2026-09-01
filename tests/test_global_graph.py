@@ -468,3 +468,99 @@ spec:
     assert G.nodes[id_a]["local_id"] == "k8s://payments/Deployment/api-server"
     assert G.nodes[id_b]["repo"] == "repo_b"
     assert G.nodes[id_b]["local_id"] == "k8s://payments/Deployment/api-server"
+
+
+def test_cross_repo_image_join_produces_single_deduped_traversal(tmp_path):
+    """R5 / contract C5 — the uber-graph join: two repos that reference the same
+    image `registry_path`, run through `global_add`, produce ONE image node with
+    the runs/publishes edges from BOTH repos rewired onto it — a real cross-repo
+    traversal with no repo-tag text in any extractor id (I3)."""
+    from graphify.extractors.k8s import extract_k8s
+
+    # Repo A: a k8s Deployment that RUNS the image.
+    repo_a = tmp_path / "builder" / "k8s"
+    repo_a.mkdir(parents=True)
+    deploy = repo_a / "deploy.yaml"
+    deploy.write_text(
+        """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/org/app:v1
+""",
+        encoding="utf-8",
+    )
+    ra = extract_k8s(deploy)
+
+    # Repo B: a CI workflow that PUBLISHES the image.
+    repo_b = tmp_path / "cloud" / ".github" / "workflows"
+    repo_b.mkdir(parents=True)
+    wf = repo_b / "ci.yaml"
+    wf.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v5
+        with:
+          tags: ghcr.io/org/app:v2
+""",
+        encoding="utf-8",
+    )
+    rb = extract_k8s(wf)
+
+    # The join key is identical across repos: id == label == tag-less path.
+    img_id = "image://ghcr.io/org/app"
+    a_images = [n for n in ra["nodes"] if n["id"] == img_id]
+    b_images = [n for n in rb["nodes"] if n["id"] == img_id]
+    assert len(a_images) == 1 and a_images[0]["source_file"] is None
+    assert len(b_images) == 1 and b_images[0]["source_file"] is None
+    # No repo identity leaks into any extractor id (I3): the global_add
+    # `repo_tag::` prefix is the ONLY place a repo tag appears, so a raw
+    # extractor id must never start with `builder::`/`cloud::`.
+    for n in ra["nodes"] + rb["nodes"]:
+        assert not n["id"].startswith(("builder::", "cloud::"))
+
+    # Assemble source graphs (nodes+edges only) and compose via global_add.
+    g_a = tmp_path / "graph_a.json"
+    g_b = tmp_path / "graph_b.json"
+    _graph_to_json(_make_graph(ra["nodes"], ra["edges"]), g_a)
+    _graph_to_json(_make_graph(rb["nodes"], rb["edges"]), g_b)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g_a, "builder")
+        global_add(g_b, "cloud")
+        G = _load_global_graph()
+
+    # ONE image node survives (deduped by label via source_file-falsy merge).
+    image_nodes = [n for n, d in G.nodes(data=True) if d.get("file_type") == "image"]
+    assert len(image_nodes) == 1
+    # It keeps the FIRST repo's prefixed id (the join seam remaps subsequent copies).
+    assert image_nodes[0] in ("builder::" + img_id, "cloud::" + img_id)
+
+    # Both the runs edge (repo A) and the publishes edge (repo B) are attached to it.
+    runs = [e for e in G.edges(data=True) if e[2].get("relation") == "runs"]
+    publishes = [e for e in G.edges(data=True) if e[2].get("relation") == "publishes"]
+    assert len(runs) == 1
+    assert len(publishes) == 1
+    # Every runs/publishes edge is incident to the single deduped image node.
+    assert runs[0][1] == image_nodes[0] or runs[0][0] == image_nodes[0]
+    assert publishes[0][1] == image_nodes[0] or publishes[0][0] == image_nodes[0]
+    # The traversal is genuinely cross-repo: the runs source and publishes source
+    # carry different repo prefixes.
+    runs_repo = runs[0][0].split("::")[0]
+    publishes_repo = (publishes[0][0] if publishes[0][1] == image_nodes[0] else publishes[0][1]).split("::")[0]
+    assert runs_repo != publishes_repo
