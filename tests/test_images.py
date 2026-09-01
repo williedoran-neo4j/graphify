@@ -61,6 +61,30 @@ def test_image_ref_node_concrete_registry_references_and_rejects_placeholders():
     # 8. Empty string → None.
     assert image_ref_node("") is None
 
+    # 9. Make variable → None (I5: placeholders/vars are never images).
+    assert image_ref_node("$(REGISTRY)/app:latest") is None
+
+    # 10. Shell variable → None.
+    assert image_ref_node("${REGISTRY}/app") is None
+
+    # 11. Bare shell variable → None.
+    assert image_ref_node("$REGISTRY/app") is None
+
+    # 12. URL → None (not an image spec).
+    assert image_ref_node("https://dist.neo4j.org/x/y") is None
+
+    # 13. Relative path → None (no registry authority).
+    assert image_ref_node("./cmd/nes") is None
+    assert image_ref_node("../deployments/foo") is None
+
+    # 14. Absolute path → None.
+    assert image_ref_node("/usr/local/bin/x") is None
+
+    # 15. Makefile recipe fragments with shell metacharacters → None.
+    assert image_ref_node("out/bin/ensure --flag=value") is None
+    assert image_ref_node("app.kubernetes.io/name=neo4j-db") is None
+    assert image_ref_node("bin/build --tag *") is None
+
 
 def test_image_file_type_passes_validation_and_survives_build():
     """A container-image node with file_type="image" and source_file=None must
