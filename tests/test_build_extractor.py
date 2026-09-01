@@ -293,3 +293,51 @@ def test_extract_build_makefile_image_without_tag_flag(tmp_path):
     assert builds_edges[0]["target"] == image_id
     assert builds_edges[0]["confidence"] == "EXTRACTED"
     assert builds_edges[0]["source_file"] == str(makefile)
+
+
+def test_extract_build_makefile_trailing_backslash_continuation(tmp_path):
+    """A Makefile whose target/prerequisite lines use a trailing-backslash
+    continuation (the canonical make idiom for breaking long target lists across
+    lines) must not crash extract_build. The continuation is a line separator,
+    not a shell escape: a trailing `\\` must not raise shlex's "No escaped
+    character" ValueError. A target with a real recipe that names an image is
+    still extracted with its builds edge."""
+    from graphify.extractors.build import extract_build
+
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "all: tmp/.a tmp/.b \\\n"
+        "  bin/x/.sentinel \\\n"
+        "  components/fluentbit/foo.lua\n"
+        "\n"
+        "build-image:\n"
+        "\tdocker build -t ghcr.io/org/web:v1 .\n"
+    )
+
+    result = extract_build(makefile)  # must not raise
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = result["edges"]
+
+    dir_path = tmp_path.as_posix()
+
+    # The continuation list is prerequisites of `all`, not a recipe: `all` still
+    # produced a build node, and the fake continuation tokens did not become nodes.
+    all_id = f"makefile://{dir_path}/all"
+    assert all_id in nodes
+    assert nodes[all_id]["label"] == "all"
+    assert nodes[all_id]["file_type"] == "build"
+
+    # The build-image target's recipe still resolves the concrete image.
+    build_image_id = f"makefile://{dir_path}/build-image"
+    image_id = "image://ghcr.io/org/web"
+    assert build_image_id in nodes
+    assert image_id in nodes
+    assert nodes[image_id]["file_type"] == "image"
+    assert nodes[image_id]["source_file"] is None
+
+    builds_edges = [e for e in edges if e["relation"] == "builds"]
+    assert len(builds_edges) == 1
+    assert builds_edges[0]["source"] == build_image_id
+    assert builds_edges[0]["target"] == image_id
+    assert builds_edges[0]["confidence"] == "EXTRACTED"
+    assert builds_edges[0]["source_file"] == str(makefile)

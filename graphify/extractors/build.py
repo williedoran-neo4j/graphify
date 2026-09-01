@@ -12,6 +12,23 @@ def extract_build(path: Path) -> dict:
     return _extract_makefile(path)
 
 
+def _split_make_line(stripped: str) -> list[str]:
+    """Split a Makefile recipe line into tokens, tolerating make continuations.
+
+    A recipe line ending in a bare backslash is a make line-continuation, not a
+    shell escape; shlex would misread it as an escape of a missing char. Strip
+    the trailing continuation before shlex-splitting, and fall back to a naive
+    whitespace split if a line is not valid POSIX shell (e.g. unbalanced quotes
+    in a comment) rather than letting shlex crash the whole extraction."""
+    line = stripped
+    while line.endswith("\\"):
+        line = line[:-1].rstrip()
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
 def _extract_makefile(path: Path) -> dict:
     """Parse a Makefile/.mk file's named targets: one build node per target,
     plus a builds edge per target whose recipe names a concrete image."""
@@ -60,9 +77,17 @@ def _extract_makefile(path: Path) -> dict:
         if not stripped:
             flush()  # a blank line ends the preceding recipe
             continue
-        if line.startswith((" ", "\t")):
+        # A recipe line is TAB-indented (make's default .RECIPEPREFIX). A
+        # space-indented line after a target is either a continuation of the
+        # target's prerequisite list (common in large Makefiles) or a stray
+        # indentation, not a shell command — treating it as a recipe would feed
+        # path tokens into image_ref_node and synthesize fake image nodes.
+        if line.startswith("\t"):
             if cur_target_id is not None:
-                recipe_tokens.extend(shlex.split(stripped))
+                # A trailing backslash is Make's line-continuation, not a shell
+                # escape; shlex would otherwise read it as an escape of the
+                # (missing) next char and raise "No escaped character".
+                recipe_tokens.extend(_split_make_line(stripped))
             continue
         if ":" in stripped and not stripped.partition(":")[2].startswith(("=", "?", ":")):
             name = stripped.split(":", 1)[0].strip()
