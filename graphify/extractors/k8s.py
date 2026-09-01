@@ -150,6 +150,21 @@ def extract_k8s(path: Path) -> dict:
             # name a CRD, so leaving them unstamped avoids attribute churn.
             if group and not group.endswith(".k8s.io") and group not in _K8S_CORE_GROUPS:
                 attributes["api_group"] = group
+        # cert-manager Certificate references its Issuer/ClusterIssuer by
+        # spec.issuerRef, and its Service by spec.dnsNames (`<svc>.<ns>.svc…`)
+        # (R7-S4).
+        if kind == "Certificate" and isinstance(doc.get("spec"), dict):
+            issuer_ref = (doc_spec or {}).get("issuerRef")
+            if isinstance(issuer_ref, dict):
+                if isinstance(issuer_ref.get("kind"), str):
+                    attributes["issuer_kind"] = issuer_ref["kind"]
+                if isinstance(issuer_ref.get("name"), str):
+                    attributes["issuer_name"] = issuer_ref["name"]
+            dns_names = (doc_spec or {}).get("dnsNames")
+            if isinstance(dns_names, list):
+                attributes["cert_dns_names"] = [
+                    d for d in dns_names if isinstance(d, str)
+                ]
         containers = _container_names(doc)
         if containers:
             attributes["containers"] = containers
@@ -779,6 +794,64 @@ def _resolve_k8s_references(
                 "source_file": crd["source_file"],
             }
         )
+    # TLS joins (R7-S4): a Certificate's issuerRef names its Issuer/ClusterIssuer,
+    # and its dnsNames (`<svc>.<ns>.svc[.cluster.local]`) name the Service it
+    # serves. Exact matches, EXTRACTED; an absent issuer/service is left unlinked.
+    certs = [n for n in all_nodes if (n.get("attributes") or {}).get("kind") == "Certificate"]
+    if certs:
+        # Issuer/ClusterIssuer index: id `k8s://<ns>/<Kind>/<name>`.
+        issuer_index: dict[tuple[str, str], dict] = {}
+        for node in all_nodes:
+            attrs = node.get("attributes") or {}
+            if attrs.get("kind") in ("Issuer", "ClusterIssuer"):
+                node_id = node.get("id", "")
+                _, kind, name = node_id[len("k8s://"):].split("/", 2)
+                issuer_index[(kind, name)] = node
+        service_index: dict[tuple[str, str], dict] = {}
+        for node in all_nodes:
+            attrs = node.get("attributes") or {}
+            if attrs.get("kind") == "Service":
+                node_id = node.get("id", "")
+                namespace, _, name = node_id[len("k8s://"):].split("/", 2)
+                service_index[(namespace, name)] = node
+        seen_issues: set[tuple[str, str]] = set()
+        seen_serves: set[tuple[str, str]] = set()
+        for cert in certs:
+            attrs = cert.get("attributes") or {}
+            issuer_kind = attrs.get("issuer_kind")
+            issuer_name = attrs.get("issuer_name")
+            if issuer_kind and issuer_name:
+                issuer = issuer_index.get((issuer_kind, issuer_name))
+                if issuer is not None and (issuer["id"], cert["id"]) not in seen_issues:
+                    seen_issues.add((issuer["id"], cert["id"]))
+                    all_edges.append(
+                        {
+                            "source": issuer["id"],
+                            "target": cert["id"],
+                            "relation": "issues",
+                            "confidence": "EXTRACTED",
+                            "source_file": issuer["source_file"],
+                        }
+                    )
+            for dns in attrs.get("cert_dns_names") or []:
+                # `<svc>.<namespace>.svc[.cluster.local]` → (namespace, svc).
+                parts = dns.split(".")
+                if len(parts) < 2 or "svc" not in parts:
+                    continue
+                svc_name = parts[0]
+                namespace = parts[1]
+                svc = service_index.get((namespace, svc_name))
+                if svc is not None and (cert["id"], svc["id"]) not in seen_serves:
+                    seen_serves.add((cert["id"], svc["id"]))
+                    all_edges.append(
+                        {
+                            "source": cert["id"],
+                            "target": svc["id"],
+                            "relation": "serves",
+                            "confidence": "EXTRACTED",
+                            "source_file": cert["source_file"],
+                        }
+                    )
 
 
 def _resolve_kustomize_includes(

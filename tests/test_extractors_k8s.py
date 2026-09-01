@@ -1388,6 +1388,116 @@ def test_resolve_k8s_references_emits_defines_edge_from_crd_to_cr():
     assert edge["source_file"] == crd_source
 
 
+def test_resolve_k8s_references_emits_issues_edge_from_issuer_to_certificate():
+    """R7-S4 — a Certificate's spec.issuerRef (kind+name) links the matching
+    Issuer/ClusterIssuer to the Certificate via an `issues` edge (EXTRACTED).
+    A Certificate whose issuer is absent emits nothing."""
+    cert_source = "db-cert.yaml"
+    all_nodes = [
+        {
+            "id": "k8s://_cluster/ClusterIssuer/aura-cluster-issuer",
+            "label": "ClusterIssuer/aura-cluster-issuer",
+            "file_type": "k8s",
+            "source_file": "issuer.yaml",
+            "attributes": {
+                "kind": "ClusterIssuer",
+                "namespace": "_cluster",
+            },
+        },
+        {
+            "id": "k8s://default/Certificate/db-cert",
+            "label": "Certificate/db-cert",
+            "file_type": "k8s",
+            "source_file": cert_source,
+            "attributes": {
+                "kind": "Certificate",
+                "namespace": "default",
+                "issuer_kind": "ClusterIssuer",
+                "issuer_name": "aura-cluster-issuer",
+                "cert_dns_names": ["db.default.svc.cluster.local"],
+            },
+        },
+        # Certificate with an absent issuer → no edge.
+        {
+            "id": "k8s://default/Certificate/other-cert",
+            "label": "Certificate/other-cert",
+            "file_type": "k8s",
+            "source_file": cert_source,
+            "attributes": {
+                "kind": "Certificate",
+                "namespace": "default",
+                "issuer_kind": "ClusterIssuer",
+                "issuer_name": "missing-issuer",
+                "cert_dns_names": [],
+            },
+        },
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references([], all_nodes, all_edges)
+
+    issues = [e for e in all_edges if e.get("relation") == "issues"]
+    assert len(issues) == 1, f"Expected 1 issues edge, got {issues}"
+
+    edge = issues[0]
+    assert edge["source"] == "k8s://_cluster/ClusterIssuer/aura-cluster-issuer"
+    assert edge["target"] == "k8s://default/Certificate/db-cert"
+    assert edge["relation"] == "issues"
+    assert edge["confidence"] == "EXTRACTED"
+
+
+def test_resolve_k8s_references_emits_serves_edge_from_certificate_to_service():
+    """R7-S4 — a Certificate's spec.dnsNames (`<svc>.<ns>.svc[.cluster.local]`)
+    links the Certificate to the Service by (namespace, name) via a `serves` edge
+    (EXTRACTED), deduped per (cert, svc)."""
+    cert_source = "db-cert.yaml"
+    all_nodes = [
+        {
+            "id": "k8s://default/Certificate/db-cert",
+            "label": "Certificate/db-cert",
+            "file_type": "k8s",
+            "source_file": cert_source,
+            "attributes": {
+                "kind": "Certificate",
+                "namespace": "default",
+                "cert_dns_names": [
+                    "db.default.svc.cluster.local",
+                    "db.default.svc",
+                ],
+            },
+        },
+        {
+            "id": "k8s://default/Service/db",
+            "label": "Service/db",
+            "file_type": "k8s",
+            "source_file": "svc.yaml",
+            "attributes": {"kind": "Service", "namespace": "default"},
+        },
+        # A Service in a different namespace must NOT be linked.
+        {
+            "id": "k8s://other/Service/db",
+            "label": "Service/db",
+            "file_type": "k8s",
+            "source_file": "svc.yaml",
+            "attributes": {"kind": "Service", "namespace": "other"},
+        },
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references([], all_nodes, all_edges)
+
+    serves = [e for e in all_edges if e.get("relation") == "serves"]
+    # Two dnsNames both point at db.default → deduped to one edge.
+    assert len(serves) == 1, f"Expected 1 serves edge, got {serves}"
+
+    edge = serves[0]
+    assert edge["source"] == "k8s://default/Certificate/db-cert"
+    assert edge["target"] == "k8s://default/Service/db"
+    assert edge["relation"] == "serves"
+    assert edge["confidence"] == "EXTRACTED"
+    assert edge["source_file"] == cert_source
+
+
 def test_extract_k8s_emits_argo_workflow_and_template_nodes_for_workflow_template():
     """An Argo WorkflowTemplate with entrypoint and templates emits a workflow-level
     node with argo:// id and file_type='argo', plus one template node per
