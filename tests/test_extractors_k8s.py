@@ -2640,3 +2640,38 @@ jobs: just-a-string
         result = extract_k8s(workflow)
         assert result["nodes"] == []
         assert result["edges"] == []
+
+
+def test_extract_ci_skips_non_dict_job_entries(tmp_path):
+    """A CI workflow whose jobs dict contains a non-dict entry (e.g. a scalar
+    string) yields no node for that entry. Only dict-valued job entries emit
+    nodes, and edges remain empty."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+  bad: just-a-string
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    assert len(nodes) == 1, f"Expected 1 node, got {len(nodes)}: {nodes!r}"
+    assert edges == []
+
+    labels = {n["label"] for n in nodes}
+    assert labels == {"build"}
+
+    node = nodes[0]
+    assert node["label"] == "build"
+    assert node["file_type"] == "ci"

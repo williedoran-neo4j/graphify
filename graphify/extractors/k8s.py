@@ -842,8 +842,10 @@ def _extract_ci(path: Path, raw_text: str) -> dict:
         jobs = doc.get("jobs")
         if not isinstance(jobs, dict):
             continue
-        for job_key in jobs:
+        for job_key, job_value in jobs.items():
             if not isinstance(job_key, str):
+                continue
+            if not isinstance(job_value, dict):
                 continue
             nodes.append(
                 {
