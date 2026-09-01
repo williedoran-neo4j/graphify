@@ -88,6 +88,8 @@ def extract_k8s(path: Path) -> dict:
         return _extract_argo(path, raw_text)
     if dialect is Dialect.KUSTOMIZATION:
         return _extract_kustomize(path, raw_text)
+    if dialect is Dialect.CI_WORKFLOW:
+        return _extract_ci(path, raw_text)
     if dialect is not Dialect.K8S_MANIFEST:
         return {"nodes": [], "edges": [], "k8s_candidates": []}
     nodes = []
@@ -828,3 +830,28 @@ def _container_names(doc: dict) -> list[str]:
     if not isinstance(containers, list):
         return []
     return [c["name"] for c in containers if isinstance(c, dict) and isinstance(c.get("name"), str)]
+
+
+def _extract_ci(path: Path, raw_text: str) -> dict:
+    """Extract one node per top-level jobs.<key> in a CI workflow document."""
+    nodes = []
+    dirname = path.parent.as_posix()
+    for doc in yaml.safe_load_all(raw_text):
+        if not isinstance(doc, dict):
+            continue
+        jobs = doc.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_key in jobs:
+            if not isinstance(job_key, str):
+                continue
+            nodes.append(
+                {
+                    "id": f"ci://{dirname}/{job_key}",
+                    "label": job_key,
+                    "file_type": "ci",
+                    "source_file": str(path),
+                    "source_location": "doc0",
+                }
+            )
+    return {"nodes": nodes, "edges": [], "k8s_candidates": []}

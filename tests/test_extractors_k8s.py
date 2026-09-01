@@ -333,8 +333,14 @@ jobs:
         result_custom = extract_k8s(custom)
         result_non = extract_k8s(non_k8s)
 
-        # Non-k8s must return empty.
-        assert result_non["nodes"] == []
+        # Workflow with one job now yields one ci node (not empty after C3).
+        assert len(result_non["nodes"]) == 1
+        ci_node = result_non["nodes"][0]
+        assert ci_node["file_type"] == "ci"
+        assert ci_node["label"] == "build"
+        assert ci_node["source_file"] == str(non_k8s)
+        assert ci_node["source_location"] == "doc0"
+        assert ci_node["id"].startswith("ci://")
         assert result_non["edges"] == []
 
         # Deployment assertions.
@@ -2571,3 +2577,66 @@ secretGenerator:
     result2 = extract_k8s(kustomization)
 
     assert result1 == result2
+
+
+def test_extract_k8s_routes_ci_workflow_to_extract_ci_and_emits_job_nodes(tmp_path):
+    """A GitHub Actions workflow with two jobs is routed through _extract_ci,
+    emitting one node per job with file_type='ci', label set to the job key,
+    and a ci:// id that is stable and /-joined. No edges or ci_candidates are
+    emitted at pass 1."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+
+    nodes = result["nodes"]
+    edges = result["edges"]
+    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
+    assert edges == []
+    assert "ci_candidates" not in result or result.get("ci_candidates", []) == []
+
+    labels = {n["label"] for n in nodes}
+    assert labels == {"build", "deploy"}
+
+    for n in nodes:
+        assert n["file_type"] == "ci"
+        assert n["source_file"] == str(workflow)
+        assert n["source_location"] == "doc0"
+        assert n["id"].startswith("ci://")
+        assert n["label"] in n["id"]
+
+
+def test_extract_ci_defensive_jobs_not_dict_returns_empty():
+    """A CI workflow where jobs is not a dict yields zero nodes and zero edges."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        workflow = td_path / "workflow.yaml"
+        workflow.write_text(
+            """\
+name: CI
+on: push
+jobs: just-a-string
+""",
+            encoding="utf-8",
+        )
+
+        result = extract_k8s(workflow)
+        assert result["nodes"] == []
+        assert result["edges"] == []
