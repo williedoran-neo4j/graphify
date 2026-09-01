@@ -564,3 +564,98 @@ jobs:
     runs_repo = runs[0][0].split("::")[0]
     publishes_repo = (publishes[0][0] if publishes[0][1] == image_nodes[0] else publishes[0][1]).split("::")[0]
     assert runs_repo != publishes_repo
+
+
+def test_global_add_links_cross_repo_package_dependency(tmp_path):
+    """R6 C3 — global_add links a package dependency to its defining package in a
+    different repo, mirroring merge-graphs. Package nodes are sourced, so they
+    bypass global_add's source_file-falsy image merge; the link pass adds the
+    cross-repo depends_on edge on the composed global graph."""
+    # repoA's package depends on a package whose defining manifest is in repoB.
+    g1 = tmp_path / "graph1.json"
+    g2 = tmp_path / "graph2.json"
+    GA = _make_graph(
+        [
+            {"id": "pkg_consumer", "label": "consumer", "type": "package",
+             "file_type": "code", "source_file": "a/pyproject.toml"},
+            {"id": "pkg_shared_lib", "label": "shared-lib", "type": "package",
+             "file_type": "code", "source_file": None},
+        ],
+        [{"source": "pkg_consumer", "target": "pkg_shared_lib",
+          "relation": "depends_on", "confidence": "EXTRACTED",
+          "context": "dependency", "source_file": "a/pyproject.toml"}],
+    )
+    GB = _make_graph(
+        [{"id": "pkg_shared_lib", "label": "shared-lib", "type": "package",
+          "file_type": "code", "source_file": "b/pyproject.toml"}],
+    )
+    _graph_to_json(GA, g1)
+    _graph_to_json(GB, g2)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "repoA")
+        global_add(g2, "repoB")
+        G = _load_global_graph()
+
+    # One cross-repo depends_on link from repoA's consumer to repoB's definition.
+    cross = [e for e in G.edges(data=True)
+             if e[2].get("relation") == "depends_on" and e[2].get("context") == "cross_repo"]
+    assert len(cross) == 1, cross
+    u, v, d = cross[0]
+    assert {u, v} == {"repoA::pkg_consumer", "repoB::pkg_shared_lib"}
+    assert d["confidence"] == "INFERRED"
+
+
+def test_global_add_links_package_dependency_across_repos(tmp_path):
+    """R6 C3 — global_add runs the package-dependency link pass, so a dependency
+    whose package node lives in another repo (source_file set, so NOT caught by
+    the source_file-falsy image merge) is connected by a cross-repo depends_on
+    edge in the persisted global graph."""
+    # svc_a: package `consumer` depends on `shared-lib`, whose definition is in
+    # svc_b. The reference node is present (source_file=None, minted by build C1).
+    def _pkg(nid, label, sf):
+        d = {"id": nid, "label": label, "file_type": "code", "type": "package",
+             "ecosystem": "python"}
+        if sf is not None:
+            d["source_file"] = sf
+        return d
+
+    GA = _make_graph(
+        [
+            _pkg("pkg_consumer", "consumer", "consumer/pyproject.toml"),
+            _pkg("pkg_shared_lib", "shared-lib", None),
+        ],
+        [{"source": "pkg_consumer", "target": "pkg_shared_lib",
+          "relation": "depends_on", "confidence": "EXTRACTED", "context": "dependency"}],
+    )
+    GB = _make_graph([_pkg("pkg_shared_lib", "shared-lib", "shared/pyproject.toml")])
+
+    g1 = tmp_path / "graph_a.json"
+    g2 = tmp_path / "graph_b.json"
+    _graph_to_json(GA, g1)
+    _graph_to_json(GB, g2)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "svc_a")
+        global_add(g2, "svc_b")
+        G = _load_global_graph()
+
+    # svc_b's definition node is present and keeps its repo/source_file.
+    assert "svc_b::pkg_shared_lib" in G.nodes
+    assert G.nodes["svc_b::pkg_shared_lib"]["source_file"]  # a real definition
+
+    # A cross-repo depends_on link exists from svc_a's consuming package to
+    # svc_b's defining package.
+    cross = [e for e in G.edges(data=True) if e[2].get("context") == "cross_repo"]
+    assert len(cross) == 1
+    u, v, d = cross[0]
+    assert d["relation"] == "depends_on"
+    assert {u, v} == {"svc_a::pkg_consumer", "svc_b::pkg_shared_lib"}
