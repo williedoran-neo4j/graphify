@@ -14,6 +14,7 @@ class Dialect(Enum):
     K8S_MANIFEST = auto()
     ARGO_WORKFLOW = auto()
     KUSTOMIZATION = auto()
+    CI_WORKFLOW = auto()
 
 
 def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
@@ -34,9 +35,17 @@ def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
     all_argo = True
     saw_kustomize = False
     all_kustomize = True
+    saw_ci = False
+    all_ci = True
     for doc in docs:
         if not isinstance(doc, dict):
             return None
+        if "jobs" in doc and "apiVersion" not in doc and "kind" not in doc:
+            saw_ci = True
+            all_argo = False
+            all_kustomize = False
+            continue
+        all_ci = False
         api_version = doc.get("apiVersion")
         kind = doc.get("kind")
         if not isinstance(api_version, str) or not isinstance(kind, str):
@@ -58,7 +67,9 @@ def detect_dialect(path: Path, raw_text: str) -> Dialect | None:
         return Dialect.ARGO_WORKFLOW
     if all_kustomize:
         return Dialect.KUSTOMIZATION
-    if saw_argo or saw_kustomize:
+    if all_ci:
+        return Dialect.CI_WORKFLOW
+    if saw_argo or saw_kustomize or saw_ci:
         return None
     return Dialect.K8S_MANIFEST
 

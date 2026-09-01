@@ -212,6 +212,55 @@ metadata:
     assert detect_dialect(p, argo_app) is None
 
 
+def test_detect_dialect_classifies_ci_workflow_and_rejects_mixed_and_k8s_with_jobs():
+    """detect_dialect returns CI_WORKFLOW for a GitHub Actions YAML with a top-level
+    dict containing a 'jobs' key and no apiVersion or kind. Mixed documents
+    (workflow + k8s manifest) return None, and a k8s manifest that also contains a
+    'jobs' key but has apiVersion/kind is classified as K8S_MANIFEST, not CI."""
+    p = Path("/dev/null")
+
+    # Single GitHub Actions workflow — valid CI dialect.
+    ci_workflow = """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"""
+    assert detect_dialect(p, ci_workflow) is Dialect.CI_WORKFLOW
+
+    # Multi-document: workflow + k8s manifest → mixed, so None.
+    mixed_ci_k8s = """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+"""
+    assert detect_dialect(p, mixed_ci_k8s) is None
+
+    # A k8s manifest with a 'jobs' key but also apiVersion/kind → K8S_MANIFEST, not CI.
+    k8s_with_jobs = """\
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-job
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+"""
+    assert detect_dialect(p, k8s_with_jobs) is Dialect.K8S_MANIFEST
+
+
 def test_extract_k8s_emits_raw_id_nodes_with_attributes_and_ignores_non_k8s():
     """extract_k8s emits one node per k8s manifest doc with raw k8s:// ids,
     labels, file_type, source metadata, and attributes including containers.
