@@ -1238,6 +1238,97 @@ def test_resolve_k8s_references_emits_selects_edge_for_subset_selector_match():
     assert "k8s://other/Deployment/api" not in targets
 
 
+def test_extract_k8s_emits_routes_edges_from_ingress_to_service(tmp_path):
+    """R7 — an Ingress's spec.rules[].http.paths[].backend.service.name emits a
+    routes edge (EXTRACTED) to the Service of that name in the same namespace,
+    connecting HTTP ingress → backend service. Non-service backends are ignored."""
+    mgmt = tmp_path / "ingress.yaml"
+    mgmt.write_text(
+        """\
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+  namespace: prod
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service
+                port:
+                  number: 443
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8443
+    - host: alt.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service
+                port:
+                  number: 443
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(mgmt)
+    edges = result["edges"]
+
+    routes = [e for e in edges if e.get("relation") == "routes"]
+    # web-service referenced twice (dedup by (ingress, service)), api-service once.
+    assert len(routes) == 2, f"Expected 2 deduped routes edges, got {routes}"
+
+    ingress_id = "k8s://prod/Ingress/web-ingress"
+    by_target = {e["target"]: e for e in routes}
+    assert by_target["k8s://prod/Service/web-service"]["source"] == ingress_id
+    assert by_target["k8s://prod/Service/api-service"]["source"] == ingress_id
+    for e in routes:
+        assert e["relation"] == "routes"
+        assert e["confidence"] == "EXTRACTED"
+        assert e["source_file"] == str(mgmt)
+
+    # No node is fabricated for the Service — it is a reference to another manifest.
+    assert "k8s://prod/Service/web-service" not in {n["id"] for n in result["nodes"]}
+
+
+def test_extract_k8s_ingress_ignores_non_service_backends(tmp_path):
+    """An Ingress backend referencing a resource kind other than Service emits no
+    routes edge."""
+    mgmt = tmp_path / "ingress.yaml"
+    mgmt.write_text(
+        """\
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+  namespace: prod
+spec:
+  defaultBackend:
+    resource:
+      apiGroup: k8s.example.com
+      kind: StorageBucket
+      name: static-assets
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(mgmt)
+    routes = [e for e in result["edges"] if e.get("relation") == "routes"]
+    assert routes == []
+
+
 def test_extract_k8s_emits_argo_workflow_and_template_nodes_for_workflow_template():
     """An Argo WorkflowTemplate with entrypoint and templates emits a workflow-level
     node with argo:// id and file_type='argo', plus one template node per

@@ -178,7 +178,60 @@ def extract_k8s(path: Path) -> dict:
                             "source_file": str(path),
                         }
                     )
+        if kind == "Ingress":
+            for svc_name in _ingress_service_names(doc):
+                svc_id = f"k8s://{namespace}/Service/{svc_name}"
+                if (workload_id, svc_id) not in seen_edges:
+                    seen_edges.add((workload_id, svc_id))
+                    edges.append(
+                        {
+                            "source": workload_id,
+                            "target": svc_id,
+                            "relation": "routes",
+                            "confidence": "EXTRACTED",
+                            "source_file": str(path),
+                        }
+                    )
     return {"nodes": nodes, "edges": edges, "k8s_candidates": candidates}
+
+
+def _ingress_service_names(doc: dict) -> list[str]:
+    """Service names a k8s Ingress routes to, from every rule path backend and
+    the default backend. Non-service backends (resource refs) are ignored, and
+    names are deduped (a service referenced by several paths/hosts appears once)."""
+    names: list[str] = []
+    seen: set[str] = set()
+    spec = doc.get("spec")
+    if not isinstance(spec, dict):
+        return names
+
+    def _add(backend: object) -> None:
+        if not isinstance(backend, dict):
+            return
+        svc = backend.get("service")
+        if isinstance(svc, dict) and isinstance(svc.get("name"), str):
+            if svc["name"] not in seen:
+                seen.add(svc["name"])
+                names.append(svc["name"])
+
+    default = spec.get("defaultBackend")
+    if isinstance(default, dict):
+        _add(default)
+    rules = spec.get("rules")
+    if isinstance(rules, list):
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            http = rule.get("http")
+            if not isinstance(http, dict):
+                continue
+            paths = http.get("paths")
+            if not isinstance(paths, list):
+                continue
+            for path in paths:
+                if isinstance(path, dict):
+                    _add(path.get("backend"))
+    return names
 
 
 def _pod_spec(doc: dict) -> dict | None:
