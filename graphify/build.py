@@ -62,6 +62,18 @@ def _is_ast_tier(item: dict) -> bool:
 # this collapse actually needs.
 _GENERIC_RELATIONS: frozenset[str] = frozenset({"references", "uses", "mentions"})
 
+
+def _is_external_package_id(nid: str) -> bool:
+    """True if ``nid`` is a canonical external-package id (``pkg_<name>``).
+
+    Package manifests (manifest_ingest.py) key every dependency on
+    ``make_id("pkg", name)`` — an underscore-joined, ``pkg_``-prefixed id with no
+    ``://``. A dangling edge endpoint with this shape is a dependency on a package
+    whose own manifest is not in this repo, so it is a cross-repo join key to
+    preserve, not an import to drop. Terraform/argo ``depends_on`` targets use
+    ``resource.``/``var.``/``argo://`` forms, so ``pkg_`` is unambiguous."""
+    return isinstance(nid, str) and nid.startswith("pkg_") and "://" not in nid
+
 # Language interop families, keyed by extension, for the cross-language phantom-edge
 # guard in the edge loop below. Families group by REAL interop (JS/TS share a module
 # graph; C/C++/ObjC share a compilation unit via headers; JVM langs share bytecode),
@@ -1160,7 +1172,26 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         if tgt not in node_set:
             tgt = norm_to_id.get(_normalize_id(tgt), tgt)
         if src not in node_set or tgt not in node_set:
-            continue  # skip edges to external/stdlib nodes - expected, not an error
+            # A depends_on edge to an external-package id must survive build so a
+            # cross-repo package join (R6) can match it later; materialize the
+            # dangling endpoint as an external reference, NOT a full definition.
+            rel = edge.get("relation")
+            if rel == "depends_on" and (
+                (tgt not in node_set and _is_external_package_id(tgt))
+                or (src not in node_set and _is_external_package_id(src))
+            ):
+                for missing in (tgt, src):
+                    if missing not in node_set and _is_external_package_id(missing):
+                        G.add_node(
+                            missing,
+                            file_type="code",
+                            type="package",
+                            source_file=None,
+                            label=missing,
+                        )
+                        node_set.add(missing)
+            else:
+                continue  # skip edges to external/stdlib nodes - expected, not an error
         # `target_file` is a transient import-disambiguation salt hint (#1814)
         # with no downstream reader; it holds an absolute path, so it must never
         # be persisted. Disambiguation already pops it off fresh extractions —

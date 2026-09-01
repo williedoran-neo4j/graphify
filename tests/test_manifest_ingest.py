@@ -100,13 +100,66 @@ def test_apm_dependency_collapses_to_single_canonical_node(tmp_path):
     assert len(dep_edges) == 2  # both dependents point at the one core node
 
 
-def test_external_dependency_edge_pruned_not_orphaned(tmp_path):
-    # A dep whose manifest isn't in the corpus: the edge dangles and build prunes it.
+def test_external_dependency_edge_preserved_as_external_reference(tmp_path):
+    # A dep whose manifest isn't in the corpus: the edge is preserved and the
+    # dangling endpoint materialized as an external reference stub.
     p = _write(tmp_path / "apm.yml", "name: leaf\ndependencies:\n  - some-external-pkg\n")
     result = extract([p], cache_root=tmp_path)
     g = build_from_json(result)
-    assert "pkg_some_external_pkg" not in set(g.nodes())  # no fabricated external node
+    assert "pkg_some_external_pkg" in g  # external reference node materialized
+    ext = g.nodes["pkg_some_external_pkg"]
+    assert ext.get("type") == "package"
+    assert ext.get("file_type") == "code"
+    assert ext.get("source_file") is None
     assert [n for n, d in g.nodes(data=True) if d.get("label") == "leaf"]
+    dep_edges = [(u, v, d) for u, v, d in g.edges(data=True) if d.get("relation") == "depends_on"]
+    assert any(u == "pkg_leaf" and v == "pkg_some_external_pkg" for u, v, d in dep_edges)
+
+
+def test_non_pkg_dangling_depends_on_and_non_depends_on_edges_still_dropped(tmp_path):
+    # build_from_json preserves depends_on edges with pkg_* endpoints only.
+    # depends_on to non-pkg targets (module.foo, argo://…) and non-depends_on
+    # dangling edges are still dropped as before.
+    p = _write(tmp_path / "apm.yml", "name: leaf\ndependencies:\n  - some-external-pkg\n")
+    result = extract([p], cache_root=tmp_path)
+    # Inject dangling edges that must NOT survive build.
+    result["edges"].append({
+        "source": "pkg_leaf",
+        "target": "module.foo",
+        "relation": "depends_on",
+        "confidence": "EXTRACTED",
+    })
+    result["edges"].append({
+        "source": "pkg_leaf",
+        "target": "argo://some/thing",
+        "relation": "depends_on",
+        "confidence": "EXTRACTED",
+    })
+    result["edges"].append({
+        "source": "pkg_leaf",
+        "target": "missing_import",
+        "relation": "imports_from",
+        "confidence": "EXTRACTED",
+    })
+    g = build_from_json(result)
+    # pkg_* depends_on survives — external reference node materialized
+    assert "pkg_some_external_pkg" in g
+    ext = g.nodes["pkg_some_external_pkg"]
+    assert ext.get("type") == "package"
+    assert ext.get("file_type") == "code"
+    assert ext.get("source_file") is None
+    dep_edge = [(u, v, d) for u, v, d in g.edges(data=True)
+                if u == "pkg_leaf" and v == "pkg_some_external_pkg" and d.get("relation") == "depends_on"]
+    assert dep_edge, "depends_on edge to pkg_* should be preserved"
+    # non-pkg dangling depends_on dropped — no nodes fabricated
+    assert "module.foo" not in g
+    assert "argo://some/thing" not in g
+    # non-depends_on dangling dropped — no node fabricated
+    assert "missing_import" not in g
+    assert not any(
+        u == "pkg_leaf" and v in ("module.foo", "argo://some/thing", "missing_import")
+        for u, v in g.edges()
+    )
 
 
 def test_malformed_manifest_does_not_crash(tmp_path):
