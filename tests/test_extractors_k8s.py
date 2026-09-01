@@ -2675,3 +2675,151 @@ jobs:
     node = nodes[0]
     assert node["label"] == "build"
     assert node["file_type"] == "ci"
+
+
+def test_extract_ci_emits_publishes_edge_for_docker_build_push_action_step(tmp_path):
+    """A CI workflow with a docker/build-push-action step that names a concrete
+    registry image emits a ci job node, an image node (tag stripped), and a single
+    publishes edge. The preceding actions/checkout step must NOT become an image
+    node because action refs are not docker images."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/build-push-action@v5
+        with:
+          tags: ghcr.io/org/app:latest
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    # Exactly 2 nodes: 1 CI job + 1 image
+    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
+
+    ci_nodes = [n for n in nodes if n["file_type"] == "ci"]
+    image_nodes = [n for n in nodes if n["file_type"] == "image"]
+
+    assert len(ci_nodes) == 1
+    assert len(image_nodes) == 1
+
+    ci_node = ci_nodes[0]
+    assert ci_node["label"] == "build"
+    assert ci_node["id"].startswith("ci://")
+
+    image_node = image_nodes[0]
+    assert image_node["id"] == "image://ghcr.io/org/app"
+    assert image_node["label"] == "ghcr.io/org/app"
+    assert image_node["file_type"] == "image"
+    assert image_node["source_file"] is None
+    assert image_node["attributes"]["registry"] == "ghcr.io"
+    assert image_node["attributes"]["tags"] == ["latest"]
+
+    # Exactly 1 publishes edge
+    assert len(edges) == 1, f"Expected 1 edge, got {len(edges)}: {edges!r}"
+    assert edges[0] == {
+        "source": ci_node["id"],
+        "target": "image://ghcr.io/org/app",
+        "relation": "publishes",
+        "confidence": "EXTRACTED",
+        "source_file": str(workflow),
+    }
+
+    # actions/checkout must NOT be treated as an image
+    assert all(n["id"] != "image://actions/checkout" for n in nodes)
+
+
+def test_extract_ci_skips_placeholder_image_in_docker_build_push_action(tmp_path):
+    """A CI workflow whose docker/build-push-action step uses a ${{ vars.X }}
+    placeholder image produces only the CI job node and zero image nodes or edges,
+    because placeholders must never become image nodes."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v5
+        with:
+          tags: ${{ vars.REGISTRY }}/app:latest
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    # Only the CI job node; no image node, no edge
+    assert len(nodes) == 1, f"Expected 1 node, got {len(nodes)}: {nodes!r}"
+    assert nodes[0]["file_type"] == "ci"
+    assert nodes[0]["label"] == "build"
+
+    assert len(edges) == 0, f"Expected 0 edges, got {len(edges)}: {edges!r}"
+    assert all(n["file_type"] != "image" for n in nodes)
+
+
+def test_extract_ci_emits_publishes_edge_for_run_docker_build(tmp_path):
+    """A CI workflow with a run step containing 'docker build -t <image>' emits a
+    publishes edge from the job node to the image node, stripping the tag."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker build -t ghcr.io/org/runner:latest .
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    # Exactly 2 nodes: 1 CI job + 1 image
+    assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}: {nodes!r}"
+
+    ci_nodes = [n for n in nodes if n["file_type"] == "ci"]
+    image_nodes = [n for n in nodes if n["file_type"] == "image"]
+
+    assert len(ci_nodes) == 1
+    assert len(image_nodes) == 1
+
+    ci_node = ci_nodes[0]
+    image_node = image_nodes[0]
+
+    assert image_node["id"] == "image://ghcr.io/org/runner"
+    assert image_node["label"] == "ghcr.io/org/runner"
+    assert image_node["file_type"] == "image"
+    assert image_node["source_file"] is None
+    assert image_node["attributes"]["registry"] == "ghcr.io"
+    assert image_node["attributes"]["tags"] == ["latest"]
+
+    # Exactly 1 publishes edge
+    assert len(edges) == 1, f"Expected 1 edge, got {len(edges)}: {edges!r}"
+    assert edges[0] == {
+        "source": ci_node["id"],
+        "target": "image://ghcr.io/org/runner",
+        "relation": "publishes",
+        "confidence": "EXTRACTED",
+        "source_file": str(workflow),
+    }

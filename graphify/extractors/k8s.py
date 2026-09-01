@@ -833,8 +833,15 @@ def _container_names(doc: dict) -> list[str]:
 
 
 def _extract_ci(path: Path, raw_text: str) -> dict:
-    """Extract one node per top-level jobs.<key> in a CI workflow document."""
+    """Extract one node per top-level jobs.<key> in a CI workflow document.
+
+    Docker build/push steps also emit image nodes and publishes edges from
+    the job node to each image the step produces.
+    """
     nodes = []
+    edges = []
+    seen_image_ids: set = set()
+    seen_edges: set = set()
     dirname = path.parent.as_posix()
     for doc in yaml.safe_load_all(raw_text):
         if not isinstance(doc, dict):
@@ -847,13 +854,54 @@ def _extract_ci(path: Path, raw_text: str) -> dict:
                 continue
             if not isinstance(job_value, dict):
                 continue
+            job_id = f"ci://{dirname}/{job_key}"
             nodes.append(
                 {
-                    "id": f"ci://{dirname}/{job_key}",
+                    "id": job_id,
                     "label": job_key,
                     "file_type": "ci",
                     "source_file": str(path),
                     "source_location": "doc0",
                 }
             )
-    return {"nodes": nodes, "edges": [], "k8s_candidates": []}
+            steps = job_value.get("steps")
+            if not isinstance(steps, list):
+                continue
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                candidates = []
+                uses = step.get("uses")
+                run = step.get("run")
+                if isinstance(uses, str) and uses.startswith(
+                    "docker/build-push-action"
+                ):
+                    with_ = step.get("with")
+                    if isinstance(with_, dict):
+                        candidates.extend(
+                            v for v in with_.values() if isinstance(v, str)
+                        )
+                elif isinstance(run, str) and any(
+                    marker in run
+                    for marker in ("docker build", "docker push", "build-and-push")
+                ):
+                    candidates.extend(run.split())
+                for candidate in candidates:
+                    img_node = image_ref_node(candidate)
+                    if img_node is None:
+                        continue
+                    if img_node["id"] not in seen_image_ids:
+                        seen_image_ids.add(img_node["id"])
+                        nodes.append(dict(img_node))
+                    if (job_id, img_node["id"]) not in seen_edges:
+                        seen_edges.add((job_id, img_node["id"]))
+                        edges.append(
+                            {
+                                "source": job_id,
+                                "target": img_node["id"],
+                                "relation": "publishes",
+                                "confidence": "EXTRACTED",
+                                "source_file": str(path),
+                            }
+                        )
+    return {"nodes": nodes, "edges": edges, "k8s_candidates": []}
