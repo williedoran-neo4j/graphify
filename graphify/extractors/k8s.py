@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import posixpath
+import shlex
 from enum import Enum, auto
 from pathlib import Path
 
@@ -878,14 +879,29 @@ def _extract_ci(path: Path, raw_text: str) -> dict:
                 ):
                     with_ = step.get("with")
                     if isinstance(with_, dict):
-                        candidates.extend(
-                            v for v in with_.values() if isinstance(v, str)
-                        )
+                        tags = with_.get("tags")
+                        if isinstance(tags, str):
+                            candidates.append(tags)
                 elif isinstance(run, str) and any(
                     marker in run
                     for marker in ("docker build", "docker push", "build-and-push")
                 ):
-                    candidates.extend(run.split())
+                    tokens = shlex.split(run)
+                    if "docker push" in run:
+                        for token in tokens:
+                            if token not in ("docker", "push") and not token.startswith(
+                                "-"
+                            ):
+                                candidates.append(token)
+                                break
+                    else:
+                        for i, token in enumerate(tokens):
+                            if token in ("-t", "--tag") and i + 1 < len(tokens):
+                                image_arg = tokens[i + 1]
+                                if "${{" in image_arg or "}}" in image_arg:
+                                    break
+                                candidates.append(image_arg)
+                                break
                 for candidate in candidates:
                     img_node = image_ref_node(candidate)
                     if img_node is None:

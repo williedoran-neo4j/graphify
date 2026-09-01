@@ -2823,3 +2823,130 @@ jobs:
         "confidence": "EXTRACTED",
         "source_file": str(workflow),
     }
+
+
+def test_extract_ci_restricts_build_push_action_to_tags_only(tmp_path):
+    """A docker/build-push-action step must emit image nodes only for the image
+    declared in tags (or image-position fields), never for context, file, push,
+    labels, build-args, or cache-from values."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./docker
+          file: ./docker/Dockerfile
+          tags: ghcr.io/org/app:latest
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    image_nodes = [n for n in nodes if n["file_type"] == "image"]
+    image_ids = {n["id"] for n in image_nodes}
+
+    assert image_ids == {"image://ghcr.io/org/app"}, (
+        f"Expected exactly one image node, got {image_ids}"
+    )
+
+    assert len(edges) == 1
+    assert edges[0]["target"] == "image://ghcr.io/org/app"
+    assert edges[0]["relation"] == "publishes"
+
+
+def test_extract_ci_skips_placeholder_image_in_run_docker_build(tmp_path):
+    """A run step with 'docker build -t ${{ vars.REGISTRY }}/app:latest' must emit
+    zero image nodes and zero edges because the unresolved placeholder value must
+    never be synthesized into a fake image node."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker build -t ${{ vars.REGISTRY }}/app:latest .
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    image_nodes = [n for n in nodes if n["file_type"] == "image"]
+    assert len(image_nodes) == 0, (
+        f"Expected 0 image nodes, got {len(image_nodes)}: {[n['id'] for n in image_nodes]}"
+    )
+    assert edges == [], f"Expected 0 edges, got {edges!r}"
+
+
+def test_extract_ci_extracts_only_tag_from_run_docker_build(tmp_path):
+    """A run step 'docker build -t ghcr.io/org/runner:latest .' must emit exactly
+    one image node for the -t argument, and no image nodes for the bare '.' or
+    'docker'/'build'/'-t' tokens."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker build -t ghcr.io/org/runner:latest .
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+    nodes = result["nodes"]
+    edges = result["edges"]
+
+    image_nodes = [n for n in nodes if n["file_type"] == "image"]
+    image_ids = {n["id"] for n in image_nodes}
+
+    assert image_ids == {"image://ghcr.io/org/runner"}, (
+        f"Expected exactly one image node, got {image_ids}"
+    )
+
+    assert len(edges) == 1
+    assert edges[0]["target"] == "image://ghcr.io/org/runner"
+
+
+def test_extract_ci_plain_actions_checkout_no_image(tmp_path):
+    """A plain 'uses: actions/checkout@v4' step must never produce an image node."""
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_k8s(workflow)
+    nodes = result["nodes"]
+
+    image_nodes = [n for n in nodes if n["file_type"] == "image"]
+    assert len(image_nodes) == 0, (
+        f"Expected 0 image nodes, got {len(image_nodes)}: {[n['id'] for n in image_nodes]}"
+    )
+    assert len(nodes) == 1
+    assert nodes[0]["file_type"] == "ci"
