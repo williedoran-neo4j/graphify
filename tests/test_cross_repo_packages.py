@@ -120,3 +120,32 @@ def test_dependency_with_no_cross_repo_definition_is_not_linked(tmp_path):
     right = {"nodes": [_pkg_node("pkg_unrelated", "unrelated", "u/pyproject.toml")]}
     _, links, _ = _merge(tmp_path, left, right)
     assert [l for l in links if l.get("context") == "cross_repo"] == []
+
+
+def test_reference_nodes_are_not_linked_as_definitions(tmp_path):
+    # Both repos depend on the SAME external package (numpy): each holds only a
+    # source_file=None reference, neither defines it. The link pass must NOT link
+    # one repo's reference to the other's — there is no definition to join on.
+    left = {
+        "nodes": [
+            _pkg_node("pkg_consumer_a", "consumer-a", "a/pyproject.toml"),
+            _pkg_node("pkg_numpy", "numpy", None),  # external reference
+        ],
+        "links": [
+            {"source": "pkg_consumer_a", "target": "pkg_numpy",
+             "relation": "depends_on", "confidence": "EXTRACTED"},
+        ],
+    }
+    right = {
+        "nodes": [
+            _pkg_node("pkg_consumer_b", "consumer-b", "b/pyproject.toml"),
+            _pkg_node("pkg_numpy", "numpy", None),  # also just an external reference
+        ],
+        "links": [
+            {"source": "pkg_consumer_b", "target": "pkg_numpy",
+             "relation": "depends_on", "confidence": "EXTRACTED"},
+        ],
+    }
+    _, links, _ = _merge(tmp_path, left, right)
+    cross = [l for l in links if l.get("context") == "cross_repo"]
+    assert cross == [], f"reference-to-reference links must not be created: {cross}"

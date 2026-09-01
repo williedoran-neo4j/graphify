@@ -34,10 +34,13 @@ def link_shared_package_dependencies(merged: "nx.Graph") -> int:
     same bare id and links the depending package node to it. Same-repo links and
     targets with no cross-repo definition are left untouched.
     """
-    # bare package id -> node ids (every repo-prefixed node claiming that id).
+    # bare package id -> node ids of REAL DEFINITIONS (source_file present) only.
+    # A source_file=None node is an external reference (minted by build R6-C1),
+    # not a package definition; linking one reference to another would fabricate
+    # a join between two packages neither repo actually defines.
     by_bare: dict[str, list[str]] = defaultdict(list)
     for node, data in merged.nodes(data=True):
-        if data.get("type") == "package":
+        if data.get("type") == "package" and data.get("source_file"):
             by_bare[node.split("::", 1)[-1]].append(node)
 
     links: list[tuple[str, str]] = []
