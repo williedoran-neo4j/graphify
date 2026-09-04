@@ -46,6 +46,7 @@ from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
+from graphify.extractors.env_endpoints import extract_env_endpoints, is_env_endpoint_file  # noqa: F401
 from graphify.extractors.build import extract_build  # noqa: F401
 from graphify.extractors.k8s import (
     _resolve_argo_references,
@@ -5422,6 +5423,12 @@ def _get_extractor(path: Path) -> Any | None:
     # (#1377). apm.yml would otherwise be a .yml document handled by the LLM.
     if is_package_manifest_path(path):
         return extract_package_manifest
+    # Committed .env.* templates pin a frontend's runtime endpoints (VITE_* URLs);
+    # route them to a deterministic endpoint extractor so the frontend→backend
+    # references are queryable (R7-S3). A bare .env / .env.local stays excluded
+    # as a live secret (detect.py).
+    if is_env_endpoint_file(path):
+        return extract_env_endpoints
     # `.h` is C/C++/ObjC-ambiguous; route Objective-C headers to extract_objc
     # (the suffix map sends `.h` to extract_c, which can't read @interface etc.).
     # ObjC sniffing has priority over the C++ sniff: an Objective-C++ header can
