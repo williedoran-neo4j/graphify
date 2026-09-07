@@ -464,10 +464,11 @@ def test_vector_index_emitted_once_per_space_failure_non_fatal(
     assert "no_vec" in node_queries
     assert "SET n:Embedded" not in node_queries["no_vec"]
 
-    # Exactly two index statements, one per space, each once, idempotent and
-    # dimensioned from the sidecar meta.
+    # Exactly two vector-index statements, one per space, each once, idempotent
+    # and dimensioned from the sidecar meta. (The push also emits a separate
+    # :GraphifyNode range index; keep this assertion scoped to vector indexes.)
     ddl = [q for q, _ in push_log if "CREATE VECTOR INDEX" in q]
-    assert ddl == [q for q, _ in push_log if "IF NOT EXISTS" in q]
+    assert ddl and all("IF NOT EXISTS" in q for q in ddl)
     assert len([q for q in ddl if "embedding_text" in q]) == 1
     assert len([q for q in ddl if "embedding_code" in q]) == 1
     text_ddl = next(q for q in ddl if "embedding_text" in q)
@@ -642,6 +643,86 @@ def test_embedding_code_reads_code_group_row_not_text_row(monkeypatch, tmp_path)
     assert legacy_pushed["doc1"]["embedding_text"] == doc_text_row.tolist()
 
 
+def test_k8s_node_merge_label_is_K8s(monkeypatch):
+    """A graph node with file_type='k8s' must produce a MERGE query whose label
+    token is exactly ``K8s`` — capitalized, not ``Entity``, not lowercase ``k8s``,
+    and not stripped by the sanitizer.
+    """
+    G = nx.Graph()
+    raw_id = "k8s://payments/Deployment/api-server"
+    G.add_node(raw_id, label="api-server", file_type="k8s", source_file="payments/deployment.yaml")
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+
+    merges = [
+        (query, params)
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    ]
+    assert len(merges) == 1
+    query, params = merges[0]
+    assert params["id"] == raw_id
+    # The label token must be exactly K8s, never Entity or lowercase k8s.
+    assert "MERGE (n:K8s {id: $id})" in query
+
+
+def test_argo_node_merge_label_is_Argo(monkeypatch):
+    """A graph node with file_type='argo' must produce a MERGE query whose label
+    token is exactly ``Argo`` — capitalized, not ``Entity``, not lowercase ``argo``,
+    and not stripped by the sanitizer.
+    """
+    G = nx.Graph()
+    raw_id = "argo://payments/WorkflowTemplate/hourly-etl"
+    G.add_node(raw_id, label="WorkflowTemplate/hourly-etl", file_type="argo", source_file="payments/workflow.yaml")
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+
+    merges = [
+        (query, params)
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    ]
+    assert len(merges) == 1
+    query, params = merges[0]
+    assert params["id"] == raw_id
+    # The label token must be exactly Argo, never Entity or lowercase argo.
+    assert "MERGE (n:Argo {id: $id})" in query
+
+
+def test_kustomize_node_merge_label_is_Kustomize(monkeypatch):
+    """A graph node with file_type='kustomize' must produce a MERGE query whose
+    label token is exactly ``Kustomize`` -- capitalized, not ``Entity``, not
+    lowercase ``kustomize``, and not stripped by the sanitizer.
+    """
+    G = nx.Graph()
+    raw_id = "kustomize://payments/kustomization"
+    G.add_node(
+        raw_id,
+        label="kustomization",
+        file_type="kustomize",
+        source_file="payments/kustomization.yaml",
+    )
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+
+    merges = [
+        (query, params)
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    ]
+    assert len(merges) == 1
+    query, params = merges[0]
+    assert params["id"] == raw_id
+    # The label token must be exactly Kustomize, never Entity or lowercase kustomize.
+    assert "MERGE (n:Kustomize {id: $id})" in query
+
+
 def test_neo4j_push_code_only_sidecar_absent_text_group(monkeypatch, tmp_path):
     """A code-only first-run sidecar -- ``code_ids``/``code_vecs``/``code_meta``
     present, NO ``text_*`` group -- must still push cleanly. The embedding
@@ -702,3 +783,93 @@ def test_neo4j_push_code_only_sidecar_absent_text_group(monkeypatch, tmp_path):
     assert "embedding_code" in code_ddl
     assert "embedding_text" not in code_ddl
     assert _integer_tokens(code_ddl) == {3}
+
+
+def test_hostile_punctuation_parameterized_not_interpolated(monkeypatch):
+    """Punctuation-heavy scalar values (embedded quotes, backslashes, newlines,
+    braces) must travel inside the Cypher ``$id`` and ``$props`` parameters,
+    never be string-interpolated into the query text itself.
+    """
+    G = nx.Graph()
+    # Sentinel punctuation that would break or alter a naive f-string.
+    hostile_id = 'k8s://payments/ConfigMap/ha-"x\\y\n{z'
+    hostile_label = 'ConfigMap/name-with-"quotes-\\backslash'
+    hostile_source = 'deployments/ha-"x\\y\n{z.yaml'
+    G.add_node(
+        hostile_id,
+        label=hostile_label,
+        file_type="k8s",
+        source_file=hostile_source,
+        source_location="line_42\nline_43",
+    )
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+
+    merges = [
+        (query, params)
+        for kind, query, params in log
+        if kind == "neo4j" and "SET n +=" in query
+    ]
+    assert len(merges) == 1
+    query, params = merges[0]
+
+    # The raw values must be preserved exactly in the parameter dict.
+    assert params["id"] == hostile_id
+    assert params["props"]["id"] == hostile_id
+    assert params["props"]["label"] == hostile_label
+    assert params["props"]["source_file"] == hostile_source
+    assert params["props"]["source_location"] == "line_42\nline_43"
+
+    # The query text must be free of the hostile literal values in any value
+    # position; if they were f-string-interpolated they would appear here.
+    assert hostile_id not in query
+    assert hostile_label not in query
+    assert hostile_source not in query
+    assert "line_42\nline_43" not in query
+
+    # The parameterized placeholders must still be present in the query text.
+    assert "{id: $id}" in query
+    assert "SET n += $props" in query
+
+
+def test_push_to_neo4j_creates_id_range_index_before_edges(monkeypatch):
+    """The edge loop MATCHes ``(a {id: $src})`` with no bounded label, which is a
+    full node scan per edge — quadratic on a large graph. A push must instead:
+    (a) tag every node MERGE with the stable :GraphifyNode label, and
+    (b) emit a CREATE INDEX ... FOR (n:GraphifyNode) ON (n.id) DDL that runs
+    BEFORE the first edge MERGE statement, so the edge MATCH is an O(1) index
+    lookup rather than a scan.
+    """
+    G = nx.Graph()
+    G.add_node("n1", label="a", file_type="code")
+    G.add_node("n2", label="b", file_type="document")
+    G.add_edge("n1", "n2", relation="references")
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+    push_log = [(q, p) for kind, q, p in log if kind == "neo4j"]
+
+    node_merges = [(q, p) for q, p in push_log if "SET n +=" in q]
+    edge_merges = [(q, p) for q, p in push_log if "MERGE (a)" in q]
+
+    # (a) every node MERGE carries the :GraphifyNode stable label.
+    for query, _ in node_merges:
+        assert "n:GraphifyNode" in query
+
+    # (b) exactly one id range index on GraphifyNode, idempotent.
+    id_ddl = [q for q, _ in push_log if "CREATE INDEX" in q and "GraphifyNode" in q and "n.id" in q]
+    assert len(id_ddl) == 1
+    assert "IF NOT EXISTS" in id_ddl[0]
+
+    # The index DDL runs before the first edge MERGE statement.
+    first_edge_idx = min(
+        i for i, (q, _) in enumerate(push_log) if "MERGE (a)" in q
+    )
+    ddl_idx = min(i for i, (q, _) in enumerate(push_log) if q in id_ddl)
+    assert ddl_idx < first_edge_idx
+
+    # Edges still MERGE by id as before, but now the lookup is indexed.
+    assert len(edge_merges) == 1

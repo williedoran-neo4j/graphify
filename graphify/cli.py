@@ -2568,6 +2568,13 @@ def dispatch_command(cmd: str) -> None:
         shared_links = _link_shared(merged)
         if shared_links:
             print(f"  linked {shared_links} type declaration(s) shared across repos")
+        # A package dependency whose manifest lives in another repo is a
+        # cross-repo join too (R6): link the depending package node to the
+        # foreign package node so the traversal can cross the boundary.
+        from graphify.cross_repo_packages import link_shared_package_dependencies as _link_pkgs
+        pkg_links = _link_pkgs(merged)
+        if pkg_links:
+            print(f"  linked {pkg_links} package dependency(ies) across repos")
         # Drop whatever compose left behind (the last input's list, possibly
         # with internal duplicates) so attach_hyperedges dedups the full
         # collection by id from a clean slate.

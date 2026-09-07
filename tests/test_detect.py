@@ -2911,16 +2911,17 @@ def test_nested_graphify_out_prunes_only_configured_path(
 
 
 def test_detect_records_unclassified_extensionless_files(tmp_path):
-    # #1692: extensionless, non-shebang project files (Dockerfile, Makefile, ...)
+    # #1692: extensionless, non-shebang project files (Rakefile, LICENSE, ...)
     # were considered but left no trace. detect() now lists them under
     # "unclassified" so they can be surfaced instead of silently vanishing.
+    # Makefile and Dockerfile are now classified as CODE (C2) and are no longer
+    # expected in the unclassified list.
     (tmp_path / "app.py").write_text("def f():\n    return 1\n")
-    (tmp_path / "Dockerfile").write_text("FROM python:3.12\nRUN pip install x\n")
-    (tmp_path / "Makefile").write_text("build:\n\techo hi\n")
+    (tmp_path / "Rakefile").write_text("task :default do\n  puts 'hi'\nend\n")
     (tmp_path / "LICENSE").write_text("MIT License\n")
     res = detect(tmp_path)
     unclassified = sorted(Path(p).name for p in res.get("unclassified", []))
-    assert unclassified == ["Dockerfile", "LICENSE", "Makefile"]
+    assert unclassified == ["LICENSE", "Rakefile"]
     # real code is still classified, not swept into unclassified
     assert any("app.py" in f for f in res["files"].get("code", []))
 
@@ -3441,3 +3442,20 @@ def test_globstar_matcher_leaves_no_reference_cycle():
     finally:
         gc.enable()
     assert collected == 0, f"globstar matcher leaked {collected} cyclic objects per run"
+
+
+
+def test_classify_makefile_dockerfile_mk_as_code(tmp_path):
+    """Extensionless Makefile and Dockerfile, plus .mk files, are classified as CODE so
+    they enter the extraction path; extensionless files without a known name remain
+    unclassified."""
+
+    (tmp_path / "Makefile").write_text("all:\n\techo hello\n", encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text("FROM alpine:latest\n", encoding="utf-8")
+    (tmp_path / "foo.mk").write_text("include bar.mk\n", encoding="utf-8")
+    (tmp_path / "README").write_text("No extension, no shebang.\n", encoding="utf-8")
+
+    assert classify_file(tmp_path / "Makefile") == FileType.CODE
+    assert classify_file(tmp_path / "Dockerfile") == FileType.CODE
+    assert classify_file(tmp_path / "foo.mk") == FileType.CODE
+    assert classify_file(tmp_path / "README") is None

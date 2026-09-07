@@ -385,3 +385,277 @@ def test_global_add_rejects_oversized_source_graph(monkeypatch, tmp_path):
         from graphify.global_graph import global_add
         with pytest.raises(ValueError, match="exceeds"):
             global_add(src_graph, "repoA")
+
+
+def test_two_repos_k8s_same_raw_id_distinct_composed_nodes(tmp_path):
+    """Two repos with identical K8s manifests produce the same raw id; the extractor
+    emits no repo tag, and global_add prefixes each into a distinct node so both
+    coexist with correct local_id recovery."""
+    from graphify.extractors.k8s import extract_k8s
+
+    manifest_a = tmp_path / "repo_a" / "deployment.yaml"
+    manifest_a.parent.mkdir(parents=True)
+    manifest_a.write_text(
+        """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+""",
+        encoding="utf-8",
+    )
+
+    manifest_b = tmp_path / "repo_b" / "deployment.yaml"
+    manifest_b.parent.mkdir(parents=True)
+    manifest_b.write_text(
+        """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: payments
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+""",
+        encoding="utf-8",
+    )
+
+    # --- Extractor: raw ids, no repo tag leakage ---
+    result_a = extract_k8s(manifest_a)
+    result_b = extract_k8s(manifest_b)
+
+    assert len(result_a["nodes"]) == 1
+    assert len(result_b["nodes"]) == 1
+    raw_id = "k8s://payments/Deployment/api-server"
+    assert result_a["nodes"][0]["id"] == raw_id
+    assert result_b["nodes"][0]["id"] == raw_id
+
+    # Assemble source graphs from nodes+edges only (drop k8s_candidates).
+    g1 = tmp_path / "graph_a.json"
+    g2 = tmp_path / "graph_b.json"
+    G_a = _make_graph(result_a["nodes"], result_a["edges"])
+    G_b = _make_graph(result_b["nodes"], result_b["edges"])
+    _graph_to_json(G_a, g1)
+    _graph_to_json(G_b, g2)
+
+    # --- Compose under global_add with isolation ---
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "repo_a")
+        global_add(g2, "repo_b")
+        G = _load_global_graph()
+
+    id_a = "repo_a::k8s://payments/Deployment/api-server"
+    id_b = "repo_b::k8s://payments/Deployment/api-server"
+
+    assert id_a in G.nodes
+    assert id_b in G.nodes
+    assert G.number_of_nodes() == 2
+
+    assert G.nodes[id_a]["repo"] == "repo_a"
+    assert G.nodes[id_a]["local_id"] == "k8s://payments/Deployment/api-server"
+    assert G.nodes[id_b]["repo"] == "repo_b"
+    assert G.nodes[id_b]["local_id"] == "k8s://payments/Deployment/api-server"
+
+
+def test_cross_repo_image_join_produces_single_deduped_traversal(tmp_path):
+    """R5 / contract C5 — the uber-graph join: two repos that reference the same
+    image `registry_path`, run through `global_add`, produce ONE image node with
+    the runs/publishes edges from BOTH repos rewired onto it — a real cross-repo
+    traversal with no repo-tag text in any extractor id (I3)."""
+    from graphify.extractors.k8s import extract_k8s
+
+    # Repo A: a k8s Deployment that RUNS the image.
+    repo_a = tmp_path / "builder" / "k8s"
+    repo_a.mkdir(parents=True)
+    deploy = repo_a / "deploy.yaml"
+    deploy.write_text(
+        """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/org/app:v1
+""",
+        encoding="utf-8",
+    )
+    ra = extract_k8s(deploy)
+
+    # Repo B: a CI workflow that PUBLISHES the image.
+    repo_b = tmp_path / "cloud" / ".github" / "workflows"
+    repo_b.mkdir(parents=True)
+    wf = repo_b / "ci.yaml"
+    wf.write_text(
+        """\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v5
+        with:
+          tags: ghcr.io/org/app:v2
+""",
+        encoding="utf-8",
+    )
+    rb = extract_k8s(wf)
+
+    # The join key is identical across repos: id == label == tag-less path.
+    img_id = "image://ghcr.io/org/app"
+    a_images = [n for n in ra["nodes"] if n["id"] == img_id]
+    b_images = [n for n in rb["nodes"] if n["id"] == img_id]
+    assert len(a_images) == 1 and a_images[0]["source_file"] is None
+    assert len(b_images) == 1 and b_images[0]["source_file"] is None
+    # No repo identity leaks into any extractor id (I3): the global_add
+    # `repo_tag::` prefix is the ONLY place a repo tag appears, so a raw
+    # extractor id must never start with `builder::`/`cloud::`.
+    for n in ra["nodes"] + rb["nodes"]:
+        assert not n["id"].startswith(("builder::", "cloud::"))
+
+    # Assemble source graphs (nodes+edges only) and compose via global_add.
+    g_a = tmp_path / "graph_a.json"
+    g_b = tmp_path / "graph_b.json"
+    _graph_to_json(_make_graph(ra["nodes"], ra["edges"]), g_a)
+    _graph_to_json(_make_graph(rb["nodes"], rb["edges"]), g_b)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g_a, "builder")
+        global_add(g_b, "cloud")
+        G = _load_global_graph()
+
+    # ONE image node survives (deduped by label via source_file-falsy merge).
+    image_nodes = [n for n, d in G.nodes(data=True) if d.get("file_type") == "image"]
+    assert len(image_nodes) == 1
+    # It keeps the FIRST repo's prefixed id (the join seam remaps subsequent copies).
+    assert image_nodes[0] in ("builder::" + img_id, "cloud::" + img_id)
+
+    # Both the runs edge (repo A) and the publishes edge (repo B) are attached to it.
+    runs = [e for e in G.edges(data=True) if e[2].get("relation") == "runs"]
+    publishes = [e for e in G.edges(data=True) if e[2].get("relation") == "publishes"]
+    assert len(runs) == 1
+    assert len(publishes) == 1
+    # Every runs/publishes edge is incident to the single deduped image node.
+    assert runs[0][1] == image_nodes[0] or runs[0][0] == image_nodes[0]
+    assert publishes[0][1] == image_nodes[0] or publishes[0][0] == image_nodes[0]
+    # The traversal is genuinely cross-repo: the runs source and publishes source
+    # carry different repo prefixes.
+    runs_repo = runs[0][0].split("::")[0]
+    publishes_repo = (publishes[0][0] if publishes[0][1] == image_nodes[0] else publishes[0][1]).split("::")[0]
+    assert runs_repo != publishes_repo
+
+
+def test_global_add_links_cross_repo_package_dependency(tmp_path):
+    """R6 C3 — global_add links a package dependency to its defining package in a
+    different repo, mirroring merge-graphs. Package nodes are sourced, so they
+    bypass global_add's source_file-falsy image merge; the link pass adds the
+    cross-repo depends_on edge on the composed global graph."""
+    # repoA's package depends on a package whose defining manifest is in repoB.
+    g1 = tmp_path / "graph1.json"
+    g2 = tmp_path / "graph2.json"
+    GA = _make_graph(
+        [
+            {"id": "pkg_consumer", "label": "consumer", "type": "package",
+             "file_type": "code", "source_file": "a/pyproject.toml"},
+            {"id": "pkg_shared_lib", "label": "shared-lib", "type": "package",
+             "file_type": "code", "source_file": None},
+        ],
+        [{"source": "pkg_consumer", "target": "pkg_shared_lib",
+          "relation": "depends_on", "confidence": "EXTRACTED",
+          "context": "dependency", "source_file": "a/pyproject.toml"}],
+    )
+    GB = _make_graph(
+        [{"id": "pkg_shared_lib", "label": "shared-lib", "type": "package",
+          "file_type": "code", "source_file": "b/pyproject.toml"}],
+    )
+    _graph_to_json(GA, g1)
+    _graph_to_json(GB, g2)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "repoA")
+        global_add(g2, "repoB")
+        G = _load_global_graph()
+
+    # One cross-repo depends_on link from repoA's consumer to repoB's definition.
+    cross = [e for e in G.edges(data=True)
+             if e[2].get("relation") == "depends_on" and e[2].get("context") == "cross_repo"]
+    assert len(cross) == 1, cross
+    u, v, d = cross[0]
+    assert {u, v} == {"repoA::pkg_consumer", "repoB::pkg_shared_lib"}
+    assert d["confidence"] == "INFERRED"
+
+
+def test_global_add_links_package_dependency_across_repos(tmp_path):
+    """R6 C3 — global_add runs the package-dependency link pass, so a dependency
+    whose package node lives in another repo (source_file set, so NOT caught by
+    the source_file-falsy image merge) is connected by a cross-repo depends_on
+    edge in the persisted global graph."""
+    # svc_a: package `consumer` depends on `shared-lib`, whose definition is in
+    # svc_b. The reference node is present (source_file=None, minted by build C1).
+    def _pkg(nid, label, sf):
+        d = {"id": nid, "label": label, "file_type": "code", "type": "package",
+             "ecosystem": "python"}
+        if sf is not None:
+            d["source_file"] = sf
+        return d
+
+    GA = _make_graph(
+        [
+            _pkg("pkg_consumer", "consumer", "consumer/pyproject.toml"),
+            _pkg("pkg_shared_lib", "shared-lib", None),
+        ],
+        [{"source": "pkg_consumer", "target": "pkg_shared_lib",
+          "relation": "depends_on", "confidence": "EXTRACTED", "context": "dependency"}],
+    )
+    GB = _make_graph([_pkg("pkg_shared_lib", "shared-lib", "shared/pyproject.toml")])
+
+    g1 = tmp_path / "graph_a.json"
+    g2 = tmp_path / "graph_b.json"
+    _graph_to_json(GA, g1)
+    _graph_to_json(GB, g2)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "svc_a")
+        global_add(g2, "svc_b")
+        G = _load_global_graph()
+
+    # svc_b's definition node is present and keeps its repo/source_file.
+    assert "svc_b::pkg_shared_lib" in G.nodes
+    assert G.nodes["svc_b::pkg_shared_lib"]["source_file"]  # a real definition
+
+    # A cross-repo depends_on link exists from svc_a's consuming package to
+    # svc_b's defining package.
+    cross = [e for e in G.edges(data=True) if e[2].get("context") == "cross_repo"]
+    assert len(cross) == 1
+    u, v, d = cross[0]
+    assert d["relation"] == "depends_on"
+    assert {u, v} == {"svc_a::pkg_consumer", "svc_b::pkg_shared_lib"}

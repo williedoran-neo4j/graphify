@@ -144,6 +144,14 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
             G.add_edge(u, v, **data)
 
     added = prefixed.number_of_nodes() - len(remap)
+
+    # Link package dependencies across repos (R6): package nodes carry a
+    # source_file (unlike images), so global_add's source_file-falsy external
+    # merge above does not join them. Run the same pass as merge-graphs so the
+    # global graph carries cross-repo depends_on links too.
+    from graphify.cross_repo_packages import link_shared_package_dependencies as _link_pkgs
+    _link_pkgs(G)
+
     _save_global_graph(G)
 
     manifest["repos"][repo_tag] = {

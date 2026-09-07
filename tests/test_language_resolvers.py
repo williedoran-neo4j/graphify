@@ -72,3 +72,19 @@ def test_resolver_mutates_edges_in_place() -> None:
     edges: list[dict] = []
     run_language_resolvers([Path("a.rb")], [], [], edges, resolvers=resolvers)
     assert edges == [{"source": "x", "target": "y", "relation": "calls"}]
+
+
+def test_default_registry_contains_kustomize_after_argo() -> None:
+    # Importing extract registers the kustomize resolver for YAML suffixes, placing
+    # it after k8s_yaml and argo so that pass-2 ordering matches the prior inline
+    # wiring (kustomize resolution runs after k8s and argo resolution).
+    import graphify.extract  # noqa: F401
+
+    resolvers = [r for r in registered_resolvers()]
+    names = [r.name for r in resolvers]
+
+    assert "kustomize" in names
+    assert names.index("kustomize") > names.index("argo")
+
+    kustomize = next(r for r in resolvers if r.name == "kustomize")
+    assert kustomize.suffixes == frozenset({".yaml", ".yml"})
