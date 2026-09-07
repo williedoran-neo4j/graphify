@@ -26,34 +26,38 @@ same-named* node in another repo.
   `REFERENCES` resolution, and drop `REFERENCES` whose target is a `.`-method or a
   builtin that merely shares a name across repos.
 
-### 2. `ISSUES` / `SERVES` / `PUBLISHES` / `POINTS_TO` = 0 in the pushed graph (HIGH)
+### 2. `ISSUES` / `SERVES` / `POINTS_TO` = 0 in the pushed graph — stale extract, not missing code (MEDIUM — operational)
 
-These four edge families are implemented and unit-tested on `feat/k8s-yaml-ast`
-(`issues`+`serves` in the k8s TLS pass, `publishes` in the CI extractor,
-`points_to` in `env_endpoints`), but **zero of them survived into
-`global-graph.json` / Neo4j**.
+**Corrected diagnosis (2026-09-07).** `issues` (80) and `serves` (22) ARE emitted
+by the current code when `extract_k8s` + `_resolve_k8s_references` run on
+`neo4j-cloud` (89 cert-manager `Certificate` resources). `points_to` is emitted by
+`env_endpoints` on `.env*` files. The zero counts in Neo4j were because the pushed
+`global-graph.json` was built from **stale/partial repo extractions** (pre-merge,
+and `.env` was then unclassified), not because the extractors are broken.
 
-- **Where:** the sourcing files — CI workflow `*.yaml`, cert-manager `Certificate`
-  YAML, and `.env*` frontend files — were **not routed through the extractors**
-  in the overnight extraction batch. The early `extract` logs show these file
-  classes being reported as "not classified (no supported extension or shebang)",
-  "skipped as potentially sensitive", or "produced zero nodes".
-- **Effect:** the "frontend → backend" and "CI publishes" and "TLS" layers are
-  absent from the uber-graph, even though the edges exist in code.
-- **Fix direction:** investigate why `detect`/`_get_extractor` drops these files
-  (they should route to `extract_k8s` for CI/Certificate YAML and to
-  `extract_env_endpoints` for `.env*` templates), re-run extraction on the
-  affected repos (`upx`, `neo4j-cloud`), re-join, re-embed, re-push. Verify the
-  four rel types land with nonzero counts.
+Sub-parts:
+- `issues` / `serves` — present in code, present in a fresh extract; missing only
+  in the stale push.
+- `points_to` — present in code; `.env` now routes correctly (post-merge
+  `extract_env_endpoints`). Re-extract + re-join + re-push to recover.
+- `publishes` — **correctly absent**. Of 23 CI workflows across the 6 repos, 20
+  publish via a shell var (`docker push "$AURA_LATEST_IMAGE"`), and the 3 with a
+  concrete `-t` use non-registry / var-suffixed names. I5 says vars never become
+  image nodes, so no `publishes` edge is the *right* answer — there is no
+  concrete, cross-repo-shareable image path to join on in this corpus.
 
-### 3. `endpoint://` nodes / `points_to` bridge is missing (part of #2)
+- **Fix:** re-run a fresh `extract` (full, not `--code-only`) on `upx` and
+  `neo4j-cloud`, `global add` each, `global re-embed`, re-push. No source change.
+
+### 3. `endpoint://` nodes / `points_to` bridge — present in code, recoverable by re-extract (part of #2)
 
 The upx UI calls its backend via runtime `VITE_*` endpoints (e.g.
 `VITE_AURA_GENAI_API_BASE_URL`, the kg-builder agent API). That is exactly the
 `endpoint://<host>` + `points_to` layer, and it is the only legitimate hop from
 `upx UI → kg-builder` for the **extraction-from-a-data-source** path (the local-file
-path correctly stays intra-upx). Because #2 dropped the `.env*` files, this bridge
-is missing, so there is **no upx→kg-builder path at all** today — neither the
+path correctly stays intra-upx). `.env` now routes correctly (post-merge), so a
+fresh extract of `upx` recovers it: there is no upx→kg-builder path in the *pushed*
+graph, but the extractor emits it.
 correctly-absent local-file one (fine) nor the should-exist data-source one (bug).
 
 ## Gaps (absent-but-expected, not corrupting)
