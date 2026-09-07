@@ -264,13 +264,24 @@ def _is_graphable_source(path: Path) -> bool:
     from the ambiguous-dir (Stage 1, #1943) and generic-keyword (Stage 3, #1666)
     drops. Data/serialization formats are NOT exempt even though some route
     through the CODE path for manifest parsing: credentials.json / secrets.yaml
-    are exactly the stores those stages must keep catching.
+    are exactly the stores those stages must keep catching. Committed ``.env.*``
+    templates route to the endpoint extractor (CODE) but are not "genuine
+    programming-language source", so they stay subject to secret-dir drops.
     """
+    if path.name.lower().startswith(".env") and path.suffix.lower() not in _SECRET_PRONE_DATA_EXTS:
+        return False
     return classify_file(path) == FileType.CODE and path.suffix.lower() not in _SECRET_PRONE_DATA_EXTS
 
 
-def _is_sensitive(path: Path) -> bool:
-    """Return True if this file likely contains secrets and should be skipped."""
+def _is_sensitive(path: Path, *, tracked_files: set[str] | None = None) -> bool:
+    """Return True if this file likely contains secrets and should be skipped.
+
+    ``tracked_files`` (optional) is the set of git-tracked ``_path_identity``
+    keys for the scan; when given, a ``.env.<suffix>`` file that is git-tracked
+    is a committed placeholder and is NOT sensitive — its values are, by
+    definition, already in the repository. Bare ``.env`` / ``.env.local``
+    (live-secret forms) stay excluded even if tracked.
+    """
     # Stage 1: any PARENT directory is a known secrets dir (parts[:-1] excludes
     # the filename itself so a root-level file named "credentials" is not falsely
     # skipped — the name patterns in Stage 2 handle the filename). Dedicated
@@ -287,8 +298,20 @@ def _is_sensitive(path: Path) -> bool:
     # Stage 2: filename pattern match. Template suffixes (.example/.sample/…)
     # on .env / .envrc are the usual "safe to commit" convention — keep them
     # in the graph without opening a broad Stage 2 allowlist (#2184 / #1921).
+    # A git-tracked `.env.<suffix>` is also a committed placeholder, so treat it
+    # as graphable: it never held a secret that isn't already in the repo.
     name = path.name
     if any(p.search(name) for p in _SENSITIVE_PATTERNS) and not _is_env_template(name):
+        # A git-tracked `.env.<env>` is a committed placeholder, not a live
+        # secret. Guard so the local-secret forms (`.env.local`,
+        # `.env.example.local`, `.env.*.bak`, bare `.env`/`.envrc`) stay excluded:
+        # the name must carry a real `.env.`/`.envrc.` suffix AND the trailing
+        # label must not be `local`/`bak`.
+        lower = name.lower()
+        if tracked_files is not None and (lower.startswith(".env.") or lower.startswith(".envrc.")):
+            tail = lower.rsplit(".", 1)[-1]
+            if tail not in ("local", "bak") and _path_identity(path) in tracked_files:
+                return False
         return True
     # Stage 3: generic keywords, only when load-bearing in the name. Do NOT let a
     # bare name keyword silently drop a genuine programming-language source file:
@@ -507,6 +530,11 @@ def classify_file(path: Path) -> FileType | None:
     # and a package would split into duplicate file-anchored nodes (#1377).
     from graphify.manifest_ingest import is_package_manifest_path
     if is_package_manifest_path(path):
+        return FileType.CODE
+    # Committed `.env.*` templates pin frontend runtime endpoints; route them to
+    # the endpoint extractor (CODE) rather than dropping them as unclassified.
+    from graphify.extractors.env_endpoints import is_env_endpoint_file
+    if is_env_endpoint_file(path):
         return FileType.CODE
     # Compound extensions must be checked before simple suffix lookup
     if path.name.lower().endswith(".blade.php"):
@@ -1720,9 +1748,14 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
     explicit_ignore_patterns = _load_graphifyignore(root, gitignore=False)
     # See ignored_predicate: skip the `git ls-files` subprocess when .gitignore
     # contributes no patterns, so a non-.gitignore corpus pays nothing for it.
+    # The .env sensitivity exemption (a git-tracked `.env.<env>` is a committed
+    # placeholder) needs tracked-status even when there is no .gitignore, so ask
+    # git once whenever we are inside a repository.
+    vcs_root = _find_vcs_root(root)
+    in_vcs = vcs_root is not None and (vcs_root / ".git").exists()
     tracked_files, tracked_dirs = (
         _git_tracked_path_keys(root)
-        if gitignore and len(ignore_patterns) > len(explicit_ignore_patterns)
+        if (gitignore and len(ignore_patterns) > len(explicit_ignore_patterns)) or in_vcs
         else (set(), set())
     )
     ignore_cache: dict[Path, bool] = {}  # shared across all _is_ignored calls in this scan
@@ -1884,7 +1917,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             # try/except cannot help and the whole run hangs with no output.
             skipped_sensitive.append(str(p) + " [not a regular file]")
             continue
-        if _is_sensitive(p):
+        if _is_sensitive(p, tracked_files=tracked_files):
             skipped_sensitive.append(str(p))
             continue
         ftype = classify_file(p)

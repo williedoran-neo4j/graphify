@@ -539,10 +539,11 @@ def test_git_tracking_probe_failure_preserves_ignore_behavior(
     assert str(ignored_file) in result["ignored"]
 
 
-def test_git_lsfiles_skipped_when_no_gitignore_contributes(tmp_path, monkeypatch):
-    """Optimization (#2759): a git repo with no .gitignore in play must not pay
-    the `git ls-files` subprocess — nothing can be gitignore-dropped, so the
-    tracked-exemption is moot. A .gitignore that DOES contribute still probes."""
+def test_git_lsfiles_probes_when_in_git_repo_even_without_gitignore(tmp_path, monkeypatch):
+    """A git repo probe (`git ls-files`) still feeds the `.env` tracked-exemption:
+    a committed `.env.<env>` is a placeholder, and knowing it is tracked requires
+    the index listing even when no `.gitignore` is in play. Outside a git repo, the
+    subprocess is still skipped (nothing to look up)."""
     _git(tmp_path, "init", "-q")
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     _git(tmp_path, "add", "app.py")
@@ -557,15 +558,27 @@ def test_git_lsfiles_skipped_when_no_gitignore_contributes(tmp_path, monkeypatch
 
     monkeypatch.setattr(detect_mod.subprocess, "run", _spy)
 
-    # No .gitignore anywhere -> gitignore contributes nothing -> no probe.
+    # In a git repo, tracked-status is needed for the .env exemption -> probe.
     detect(tmp_path)
-    assert calls["ls_files"] == 0, "git ls-files ran despite no .gitignore in play"
+    assert calls["ls_files"] >= 1, "git ls-files skipped in a git repo (needed for .env tracked-exemption)"
 
-    # Add a .gitignore -> gitignore now contributes -> probe happens (once).
-    (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
-    calls["ls_files"] = 0
+
+def test_git_lsfiles_skipped_outside_git_repo(tmp_path, monkeypatch):
+    """Outside any VCS, there is no index to consult — `git ls-files` must not
+    run (fail-closed, no spurious subprocess)."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+
+    real_run = detect_mod.subprocess.run
+    calls = {"ls_files": 0}
+
+    def _spy(args, *a, **k):
+        if isinstance(args, list) and "ls-files" in args:
+            calls["ls_files"] += 1
+        return real_run(args, *a, **k)
+
+    monkeypatch.setattr(detect_mod.subprocess, "run", _spy)
     detect(tmp_path)
-    assert calls["ls_files"] >= 1, "git ls-files skipped even though .gitignore is present"
+    assert calls["ls_files"] == 0, "git ls-files ran outside a git repo"
 
 
 def test_gitignore_nested_below_root_prunes_whole_directory(tmp_path):
@@ -3375,6 +3388,29 @@ def test_sensitive_bare_keyword_prose_still_dropped():
 def test_sensitive_filter_indexes_env_templates(path):
     """Placeholder-only committed templates must not be treated as live secrets."""
     assert not _is_sensitive(Path(path)), f"{path} is a committed template, must be indexed (#2184)"
+
+
+def test_git_tracked_env_config_is_graphable():
+    """A `.env.<env>` file that is git-tracked is a committed placeholder, not a
+    live secret, so it must be admitted even when its suffix is not in the
+    template carve-out (`.preview`, `.trunk`, `.release`, ...). Bare
+    `.env`/`.env.local` remain excluded even when tracked — a tracked `.env` is a
+    committed secret, and the graphable set is `.env.*`-shaped only."""
+    from graphify.detect import _path_identity
+
+    tracked = {".env.preview", ".env.trunk", ".env.release", ".env.development", ".envrc.sample"}
+    tracked_keys = {_path_identity(Path(name)) for name in tracked}
+    for name in tracked:
+        assert not _is_sensitive(Path(name), tracked_files=tracked_keys), (
+            f"tracked {name} is a committed placeholder, must graph"
+        )
+    # Bare live-secret forms stay excluded even if hypothetically tracked.
+    for name in (".env", ".env.local", ".env.example.local", ".env.example.bak"):
+        assert _is_sensitive(Path(name), tracked_files={_path_identity(Path(name))}), (
+            f"{name} is a live secret form, must stay excluded"
+        )
+    # Without tracked info, the suffix-based behavior is unchanged.
+    assert _is_sensitive(Path(".env.preview"))
 
 
 @pytest.mark.parametrize("path", [
