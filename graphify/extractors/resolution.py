@@ -876,7 +876,7 @@ def _apply_symbol_resolution_facts(
         for edge in edges
     }
 
-    def add_edge(source: str, target: str, relation: str, context: str, line: int, source_path: Path, target_file: str | None = None, local_alias: str | None = None) -> None:
+    def add_edge(source: str, target: str, relation: str, context: str, line: int, source_path: Path, target_file: str | None = None, local_alias: str | None = None, type_only: bool = False) -> None:
         key = (source, target, relation, context or "")
         if key in existing_edges:
             return
@@ -901,6 +901,9 @@ def _apply_symbol_resolution_facts(
         # cross-file member-call resolver match `alias.func()` (#2082).
         if local_alias is not None:
             edge["local_alias"] = local_alias
+        # Erased at compile time (#3123): Import Cycles skips these edges.
+        if type_only:
+            edge["type_only"] = True
         edges.append(edge)
 
     for declaration in facts.declarations:
@@ -932,6 +935,7 @@ def _apply_symbol_resolution_facts(
                     changed = True
 
     named_exports_by_file: dict[Path, dict[str, tuple[Path, str]]] = {}
+    export_origins: dict[tuple[Path, str], set[tuple[Path, str]]] = {}
     star_exports_by_file: dict[Path, list[Path]] = {}
 
     for star_fact in facts.star_exports:
@@ -948,6 +952,7 @@ def _apply_symbol_resolution_facts(
                 star_fact.line,
                 star_fact.file_path,
                 target_file=str(path_by_resolved.get(target_path, target_path)),
+                type_only=star_fact.type_only,
             )
 
     for namespace_fact in facts.namespace_exports:
@@ -979,6 +984,7 @@ def _apply_symbol_resolution_facts(
                 namespace_fact.line,
                 namespace_fact.file_path,
                 target_file=str(path_by_resolved.get(target_path, target_path)),
+                type_only=namespace_fact.type_only,
             )
 
     for export_fact in facts.exports:
@@ -991,7 +997,14 @@ def _apply_symbol_resolution_facts(
             if origin is None and (file_path, export_fact.local_name) in symbol_nodes:
                 origin = (file_path, export_fact.local_name)
         if origin is None:
+            # An explicit export remains evidence even when extraction did not
+            # materialize its binding. Do not mistake it for an absent export.
+            if export_fact.local_name is not None:
+                export_origins.setdefault((file_path, export_fact.exported_name), set()).add(
+                    (file_path, export_fact.local_name)
+                )
             continue
+        export_origins.setdefault((file_path, export_fact.exported_name), set()).add(origin)
         named_exports_by_file.setdefault(file_path, {})[export_fact.exported_name] = origin
         if origin[0] != file_path:
             source_id = source_file_id.get(file_path)
@@ -1004,6 +1017,7 @@ def _apply_symbol_resolution_facts(
                     export_fact.line,
                     export_fact.file_path,
                     target_file=str(path_by_resolved.get(origin[0], origin[0])),
+                    type_only=export_fact.type_only,
                 )
 
     def resolve_exported_origin(target_path: Path, imported_name: str, seen: set[tuple[Path, str]] | None = None) -> tuple[Path, str]:
@@ -1025,6 +1039,71 @@ def _apply_symbol_resolution_facts(
             if resolved in symbol_nodes:
                 return resolved
         return key
+
+    def exported_candidates(
+        key: tuple[Path, str], seen: frozenset[tuple[Path, str]]
+    ) -> tuple[set[tuple[Path, str]], bool]:
+        # Distinguish a cycle cutoff from an absent export. A cycle contributes
+        # no origin; a named export of an unrepresented binding remains unknown.
+        if key in seen:
+            return set(), True
+        seen = seen | {key}
+        origins = export_origins.get(key)
+        candidates: set[tuple[Path, str]] = set()
+        cyclic = False
+        if origins is None:
+            for path in star_exports_by_file.get(key[0], []):
+                branch, branch_cyclic = exported_candidates((path, key[1]), seen)
+                candidates.update(branch)
+                cyclic |= branch_cyclic
+            return candidates, cyclic
+        for origin in origins:
+            if origin == key:
+                candidates.add(origin)
+            else:
+                branch, branch_cyclic = exported_candidates(origin, seen)
+                candidates.update(branch)
+                cyclic |= branch_cyclic
+                if not branch and not branch_cyclic:
+                    candidates.add(origin)
+        return candidates, cyclic
+
+    # The structural extractor names the immediate barrel's symbol. Resolve
+    # that exact authored export site through the shared import/export facts,
+    # including `import {x}; export {x}` bridges with no local declaration.
+    export_sites: dict[tuple[Path, str, Path], list[_SymbolExportFact]] = {}
+    for export_fact in facts.exports:
+        if export_fact.target_path is not None and export_fact.target_name is not None:
+            site = (
+                export_fact.file_path.resolve(),
+                f"L{export_fact.line}",
+                export_fact.target_path.resolve(),
+            )
+            export_sites.setdefault(site, []).append(export_fact)
+    owned_ids = {node.get("id") for node in nodes}
+    for edge in edges:
+        if edge.get("relation") != "re_exports" or edge.get("target") in owned_ids:
+            continue
+        target_file = edge.get("target_file")
+        source_path = _js_source_path(str(edge.get("source_file", "")), root)
+        if not target_file or source_path is None:
+            continue
+        target_path = Path(target_file)
+        site = (source_path, str(edge.get("source_location", "")), target_path.resolve())
+        for export_fact in export_sites.get(site, []):
+            expected = _make_id(_file_stem(target_path), export_fact.target_name)
+            if edge.get("target") != expected:
+                continue
+            candidates, _ = exported_candidates(
+                (export_fact.target_path.resolve(), export_fact.target_name), frozenset()
+            )
+            if len(candidates) == 1:
+                origin = next(iter(candidates))
+                target_id = symbol_nodes.get(origin)
+                if target_id in owned_ids:
+                    edge["target"] = target_id
+                    edge["target_file"] = str(path_by_resolved.get(origin[0], origin[0]))
+            break
 
     for import_fact in facts.imports:
         source_id = source_file_id.get(import_fact.file_path.resolve())
@@ -1088,6 +1167,11 @@ def _apply_symbol_resolution_facts(
         if target_id is None:
             continue
         source_id = use_fact.source_id
+        # Structural walking can omit named-function-local declarations while
+        # materializing callback-local ones. Only actual node ownership decides
+        # whether a type relationship has a represented source declaration.
+        if use_fact.relation in ("inherits", "implements", "references") and source_id not in owned:
+            continue
         if use_fact.relation == "calls" and source_id not in owned:
             source_id = source_file_id.get(file_path)
             if source_id is None:
@@ -1216,8 +1300,18 @@ def _js_exported_declaration_names(node, source: bytes) -> list[str]:
     if declaration is None:
         return names
 
-    if declaration.type == "lexical_declaration":
+    if declaration.type in ("lexical_declaration", "variable_declaration"):
+        # Preserve legacy aggregate-pattern facts for identifier-valued lexical
+        # declarations; individual destructured bindings are a separate feature.
         names.extend(alias for alias, _target in _js_lexical_aliases(declaration, source))
+        for declarator in declaration.named_children:
+            if declarator.type != "variable_declarator":
+                continue
+            name_node = declarator.child_by_field_name("name")
+            if name_node is not None and name_node.type == "identifier":
+                name = _read_text(name_node, source)
+                if name not in names:
+                    names.append(name)
         return names
 
     if declaration.type in (
@@ -1391,19 +1485,34 @@ def _ts_walk_class_members(class_node, source: bytes, path: Path, class_nid: str
     line = class_node.start_point[0] + 1
     for child in class_node.children:
         if child.type == "class_heritage":
+            saw_clause = False
             for clause in child.children:
                 if clause.type == "extends_clause":
+                    saw_clause = True
                     for name in _ts_heritage_clause_entries(clause, source):
                         facts.uses.append(
                             _SymbolUseFact(path, class_nid, name, "inherits", "type",
                                            clause.start_point[0] + 1)
                         )
                 elif clause.type == "implements_clause":
+                    saw_clause = True
                     for name in _ts_heritage_clause_entries(clause, source):
                         facts.uses.append(
                             _SymbolUseFact(path, class_nid, name, "implements", "type",
                                            clause.start_point[0] + 1)
                         )
+            if not saw_clause:
+                # The JavaScript grammar carries the base directly under
+                # class_heritage (`extends Base` -> [extends, identifier]) with no
+                # extends_clause/implements_clause wrapper like the TypeScript
+                # grammar. Treat the heritage node itself as the extends clause so
+                # `class Derived extends Base {}` in a .js file still emits an
+                # inherits edge. Mirrors the extends_type_clause branch below.
+                for name in _ts_heritage_clause_entries(child, source):
+                    facts.uses.append(
+                        _SymbolUseFact(path, class_nid, name, "inherits", "type",
+                                       child.start_point[0] + 1)
+                    )
         elif child.type == "extends_type_clause":
             # Interface heritage (`interface A extends B, C`) is an
             # extends_type_clause node, NOT a class_heritage. Its base entries
@@ -1542,6 +1651,13 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
 
             raw_module = _js_module_specifier(node, source)
             export_clause = _js_export_clause(node)
+            # `export type { X } from ...` / `export type * from ...`: the
+            # statement-level `type` keyword is a bare anonymous child; the
+            # default binding NAMED type sits inside the clause instead (#3123).
+            stmt_type_only = any(
+                child.type == "type" and not child.is_named
+                for child in node.children
+            )
             if raw_module is not None:
                 target_path = _resolve_js_module_path(raw_module, path.parent)
                 if target_path is None:
@@ -1555,11 +1671,13 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                             namespace_name,
                             target_path,
                             node.start_point[0] + 1,
+                            type_only=stmt_type_only,
                         )
                     )
                 elif _js_export_statement_is_star(node):
                     facts.star_exports.append(
-                        _StarExportFact(path, target_path, node.start_point[0] + 1)
+                        _StarExportFact(path, target_path, node.start_point[0] + 1,
+                                        type_only=stmt_type_only)
                     )
                 if export_clause is not None:
                     for original_name, exported_name in _js_named_specifiers(
@@ -1572,6 +1690,7 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                                 node.start_point[0] + 1,
                                 target_path=target_path,
                                 target_name=original_name,
+                                type_only=stmt_type_only,
                             )
                         )
                 continue
@@ -1883,6 +2002,8 @@ def _augment_symbol_resolution_edges(
 def _resolve_cross_file_imports(
     per_file: list[dict],
     paths: list[Path],
+    all_nodes: list[dict] | None = None,
+    all_edges: list[dict] | None = None,
 ) -> list[dict]:
     """
     Two-pass import resolution: turn file-level imports into class-level edges.
@@ -1944,9 +2065,15 @@ def _resolve_cross_file_imports(
     # shares the file (#2652). The edge is anchored at the real reference, not
     # the import line, so `source_location` points at genuine corroboration.
     new_edges: list[dict] = []
+    node_by_id = {node["id"]: node for node in all_nodes if node.get("id")} if all_nodes else {}
+    repointed_from: set[str] = set()
+    TYPE_REPOINT_RELATIONS = frozenset({"references", "inherits", "implements", "extends"})
 
     for file_result, path in zip(per_file, paths):
         str_path = str(path)
+        file_srcs = {n.get("source_file") for n in file_result.get("nodes", []) if n.get("source_file")}
+        file_srcs.add(str_path)
+        file_srcs.add(path.as_posix())
 
         # Map each local symbol (class or function) to its node id, keyed by the
         # bare symbol name. Function labels end in "()"; the file node ends in
@@ -1992,16 +2119,38 @@ def _resolve_cross_file_imports(
             target_fq: str | None = None
             for child in node.children:
                 if child.type == "relative_import":
+                    prefix_text = ""
+                    dotted_text = ""
                     for sub in child.children:
-                        if sub.type == "dotted_name":
-                            bare = _text(sub).split(".")[-1]
-                            candidate = path.parent / f"{bare}.py"
-                            target_fq = _file_stem(candidate)
-                            break
+                        if sub.type == "import_prefix":
+                            prefix_text = _text(sub)
+                        elif sub.type == "dotted_name":
+                            dotted_text = _text(sub)
+                    dots = prefix_text.count(".") if prefix_text else 1
+                    cur_dir = path.parent
+                    for _ in range(dots - 1):
+                        cur_dir = cur_dir.parent
+                    if dotted_text:
+                        candidate = cur_dir.joinpath(*dotted_text.split(".")).with_suffix(".py")
+                    else:
+                        candidate = cur_dir / "__init__.py"
+                    target_fq = _file_stem(candidate)
                     break
                 if child.type == "dotted_name" and target_fq is None:
-                    bare = _text(child).split(".")[-1]
-                    target_fq = bare_to_qualified.get(bare)
+                    dotted_name = _text(child)
+                    dotted_as_path = "/".join(dotted_name.split("."))
+                    if dotted_as_path in stem_to_entities:
+                        target_fq = dotted_as_path
+                    else:
+                        suffix_matches = [
+                            fq for fq in stem_to_entities
+                            if fq.endswith(f"/{dotted_as_path}") or fq.endswith(f"\\{dotted_as_path}")
+                        ]
+                        if len(suffix_matches) == 1:
+                            target_fq = suffix_matches[0]
+                        else:
+                            bare = dotted_name.split(".")[-1]
+                            target_fq = bare_to_qualified.get(bare)
 
             if not target_fq or target_fq not in stem_to_entities:
                 return
@@ -2075,6 +2224,31 @@ def _resolve_cross_file_imports(
                     "source_location": f"L{line}",
                     "weight": 0.8,
                 })
+
+        # Repoint AST type-reference and inheritance edges from sourceless stubs
+        # to the exact imported target definition (#3252).
+        if all_edges and import_targets:
+            for edge in all_edges:
+                if edge.get("source_file") not in file_srcs:
+                    continue
+                if edge.get("relation") not in TYPE_REPOINT_RELATIONS:
+                    continue
+                tgt = edge.get("target")
+                tgt_node = node_by_id.get(tgt)
+                if not tgt_node or tgt_node.get("source_file"):
+                    continue
+                stub_label = tgt_node.get("label", "")
+                resolved_id = import_targets.get(stub_label)
+                if resolved_id and resolved_id != tgt:
+                    edge["target"] = resolved_id
+                    repointed_from.add(tgt)
+
+    if all_nodes is not None and all_edges is not None and repointed_from:
+        still_referenced = {e.get("source") for e in all_edges} | {e.get("target") for e in all_edges}
+        all_nodes[:] = [
+            node for node in all_nodes
+            if node.get("id") not in repointed_from or node.get("id") in still_referenced
+        ]
 
     return new_edges
 

@@ -577,6 +577,62 @@ def test_ghost_merge_non_ast_same_file_still_merges():
     assert G.number_of_nodes() == 1
 
 
+def test_ghost_merge_wrong_source_file_resolved_by_label():
+    """#3344: a semantic node that only MENTIONS a file (a saved
+    graphify-out/memory/*.md query answer, a runbook narrating "see App.tsx")
+    is stamped with source_file = the document being read, not the file named
+    in its prose — so the (source_file, label) key can never match the real
+    AST node's key. Resolve it by label alone against every AST file-self node
+    (_is_file_node_label), including when the doc's prose dropped a leading
+    path segment ("customer-app/index.ts" for the real
+    "apps/customer-app/index.ts")."""
+    ext = {
+        "nodes": [
+            {"id": "apps_customer_app_app", "label": "App.tsx", "file_type": "code",
+             "source_file": "apps/customer-app/App.tsx", "source_location": "L1", "_origin": "ast"},
+            {"id": "apps_customer_app_index", "label": "customer-app/index.ts", "file_type": "code",
+             "source_file": "apps/customer-app/index.ts", "source_location": "L1", "_origin": "ast"},
+            {"id": "app", "label": "App.tsx", "file_type": "code",
+             "source_file": "graphify-out/memory/query_fake.md", "_origin": "semantic"},
+            {"id": "customer_app_index", "label": "customer-app/index.ts", "file_type": "code",
+             "source_file": "graphify-out/memory/query_fake.md", "_origin": "semantic"},
+            {"id": "some_query_node", "label": "Query: why does X connect Y?", "file_type": "document",
+             "source_file": "graphify-out/memory/query_fake.md", "_origin": "semantic"},
+        ],
+        "edges": [
+            {"source": "some_query_node", "target": "app", "relation": "references",
+             "confidence": "EXTRACTED", "source_file": "graphify-out/memory/query_fake.md"},
+            {"source": "some_query_node", "target": "customer_app_index", "relation": "references",
+             "confidence": "EXTRACTED", "source_file": "graphify-out/memory/query_fake.md"},
+        ],
+    }
+    G = build_from_json(ext, directed=False)
+    assert "app" not in G.nodes() and "customer_app_index" not in G.nodes()
+    assert G.has_edge("some_query_node", "apps_customer_app_app")
+    assert G.has_edge("some_query_node", "apps_customer_app_index")
+
+
+def test_ghost_merge_wrong_source_file_ambiguous_basename_left_alone():
+    """#3344: the label-alone fallback must stay conservative — a phantom
+    mentioning a bare basename that TWO different real files share (an
+    "index.ts" in two different directories) has no safe unique winner and
+    must be left as-is rather than merged into an arbitrary one."""
+    ext = {
+        "nodes": [
+            {"id": "apps_admin_web_index", "label": "index.ts", "file_type": "code",
+             "source_file": "apps/admin-web/src/lib/index.ts", "source_location": "L1", "_origin": "ast"},
+            {"id": "apps_api_index", "label": "index.ts", "file_type": "code",
+             "source_file": "apps/api/src/lib/index.ts", "source_location": "L1", "_origin": "ast"},
+            {"id": "phantom_index", "label": "index.ts", "file_type": "code",
+             "source_file": "graphify-out/memory/query_fake2.md", "_origin": "semantic"},
+        ],
+        "edges": [],
+    }
+    G = build_from_json(ext, directed=False)
+    assert "phantom_index" in G.nodes()
+    assert "apps_admin_web_index" in G.nodes() and "apps_api_index" in G.nodes()
+
+
 def test_build_merge_preserves_call_edge_direction(tmp_path):
     """Regression for #760.
 
@@ -1612,6 +1668,36 @@ def test_norm_source_file_relativizes_a_posix_absolute_path():
     assert _norm_source_file(
         "/home/ci/build/repo/docs/api/README.md", "/home/ci/build/repo"
     ) == "docs/api/README.md"
+
+
+def test_build_from_json_relativizes_definition_file():
+    """A merged C/C++/ObjC decl/def node records where the symbol is implemented
+    in `definition_file`. That is a path into the scanned tree just like
+    `source_file`, so the graph must store it repo-relative — otherwise the
+    build machine's absolute path ships in graph.json and a reader on another
+    checkout (or the MCP `get_node` answer) points at a file that is not there."""
+    from graphify.build import build_from_json
+
+    root = "/home/ci/build/repo"
+    extraction = {
+        "nodes": [{
+            "id": "foo_bar",
+            "label": "bar",
+            "type": "function",
+            "file_type": "code",
+            "_origin": "ast",
+            "source_file": f"{root}/src/Foo.h",
+            "source_location": "L10",
+            "definition_file": f"{root}/src/Foo.cpp",
+            "definition_location": "L42",
+        }],
+        "edges": [],
+    }
+    G = build_from_json(extraction, root=root)
+    assert G.nodes["foo_bar"]["source_file"] == "src/Foo.h"
+    assert G.nodes["foo_bar"]["definition_file"] == "src/Foo.cpp"
+    # the line number is a plain string and must survive untouched
+    assert G.nodes["foo_bar"]["definition_location"] == "L42"
 
 
 def test_derive_prune_root_recovers_root_from_posix_absolute_prune_sources():
