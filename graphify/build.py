@@ -985,6 +985,13 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                 continue
             if "source_file" in node:
                 node["source_file"] = _norm_source_file(node["source_file"], _root)
+            # definition_file names a file inside the scanned tree exactly like
+            # source_file (the #2990 decl/def merge stamps it from the impl's
+            # source_file BEFORE this normalization runs), so it must be made
+            # portable the same way - it used to ship absolute, leaking the
+            # build host's layout into graph.json and MCP get_node (#3223).
+            if "definition_file" in node:
+                node["definition_file"] = _norm_source_file(node["definition_file"], _root)
         G.add_node(node["id"], **{k: v for k, v in node.items() if k != "id"})
     node_set = set(G.nodes())
 
@@ -998,6 +1005,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     _loc_nodes: dict[tuple[str, str], str] = {}   # (source_file, label) -> canonical node id
     _loc_collisions: set[tuple[str, str]] = set()  # keys shared by 2+ AST nodes
     _noloc_nodes: dict[tuple[str, str], str] = {}  # (source_file, label) -> ghost node id
+    _ast_file_nodes: list[tuple[str, str]] = []  # (node_id, source_file) for AST file-self nodes (#3344)
 
     # Pass 1: collect canonical nodes — AST-origin nodes take precedence over LLM nodes.
     # When 2+ AST nodes share a key (same-named symbols in same-named files across
@@ -1040,6 +1048,20 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                     _loc_collisions.add(key)
                 # AST-origin nodes always overwrite a prior non-AST entry.
                 _loc_nodes[key] = nid
+                # #3344: a self-referential semantic pass (e.g. re-extracting a
+                # saved graphify-out/memory/*.md query answer) mints a NEW
+                # non-AST node for every bare file path/basename it mentions in
+                # prose ("App.tsx", "customer-app/index.ts"), stamped with
+                # source_file = the memory doc being read, NOT the file named in
+                # the prose. That wrong source_file means such a ghost can never
+                # hit the (sf, label) key above — same underlying bug as #1145,
+                # just with the (source_file, label) *pair* broken instead of
+                # only the id. Record every AST node whose own label already
+                # names its own file (_is_file_node_label — the same "is this a
+                # file node" predicate the label-disambiguation pass uses) so
+                # Pass 2b below can catch these by label alone.
+                if _is_file_node_label(label, sf):
+                    _ast_file_nodes.append((nid, sf))
             else:
                 # First non-AST node for this (file, label) wins as canonical; a
                 # later same-key node is a genuine same-file duplicate and still
@@ -1066,6 +1088,37 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         ast_id = _loc_nodes.get(key)
         if ast_id is not None:
             _ghost_remap[sem_id] = ast_id
+
+    # Pass 2b (#3344): catch ghosts the (source_file, label) key above cannot,
+    # because their source_file is simply wrong — a semantic pass over a
+    # document that only *mentions* a file (a saved graphify-out/memory/*.md
+    # query answer, a README, an ADR) stamps the file's own name as a new
+    # node's label but the DOCUMENT's path as source_file, since it has no way
+    # to know the mentioned file's real path. Resolve these by label alone
+    # against every AST file-self node collected in Pass 1, reusing
+    # _is_file_node_label so "App.tsx" matches source_file ".../App.tsx" and
+    # "customer-app/index.ts" matches ".../apps/customer-app/index.ts" (a
+    # directory-qualified suffix, e.g. the leading "apps/" the prose dropped).
+    # Conservative by construction: a label matching 0 or 2+ AST files is left
+    # alone (0 = no known file, 2+ = genuinely ambiguous — same "no safe
+    # canonical winner" rule Pass 2's _loc_collisions already applies).
+    if _ast_file_nodes:
+        for nid in sorted(node_set):
+            if nid in _ghost_remap:
+                continue  # already resolved by the exact (sf, label) key
+            attrs = G.nodes[nid]
+            if attrs.get("_origin") == "ast":
+                continue
+            label = str(attrs.get("label", "")).strip()
+            if not label:
+                continue
+            matches = {
+                ast_id for ast_id, ast_sf in _ast_file_nodes
+                if _is_file_node_label(label, ast_sf)
+            }
+            if len(matches) == 1:
+                _ghost_remap[nid] = next(iter(matches))
+
     # Remove ghost nodes from the graph; edges will be re-pointed via norm_to_id.
     for ghost_id in _ghost_remap:
         G.remove_node(ghost_id)
@@ -1233,6 +1286,10 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             )
         if "source_file" in attrs:
             attrs["source_file"] = _norm_source_file(attrs["source_file"], _root)
+        if attrs.get("definition_file"):
+            # Same portability rule as source_file (#3223); heals a graph
+            # written before the fix on its next rebuild.
+            attrs["definition_file"] = _norm_source_file(attrs["definition_file"], _root)
         # Drop cross-language phantom edges — the same short names (render, parse,
         # time, ...) recur across language boundaries, so an unresolved target can
         # bind to a same-named node in another language. The extraction spec forbids
@@ -1646,11 +1703,37 @@ def merge_raw_extraction(
             return False  # unowned — carry forward
         return _prune_hit(sf)
 
+    # #3203: Check for unverified semantic shrink on re-extracted sources.
+    unverified_semantic_shrink: dict[str, tuple[int, int]] = {}
+    if new_sem_sources:
+        prior_sem_counts: dict[str, int] = {}
+        for n in existing_nodes:
+            if isinstance(n, dict) and not _is_ast_tier(n):
+                sf = n.get("source_file")
+                if sf:
+                    canon = _norm_source_file(sf, _eff_root) or sf
+                    prior_sem_counts[canon] = prior_sem_counts.get(canon, 0) + 1
+
+        fresh_sem_counts: dict[str, int] = {}
+        for n in new.get("nodes", []):
+            if isinstance(n, dict) and not _is_ast_tier(n):
+                sf = n.get("source_file")
+                if sf:
+                    canon = _norm_source_file(sf, _eff_root) or sf
+                    fresh_sem_counts[canon] = fresh_sem_counts.get(canon, 0) + 1
+
+        for canon_sf, fresh_count in fresh_sem_counts.items():
+            prior_count = prior_sem_counts.get(canon_sf, 0)
+            if prior_count > 1 and fresh_count < prior_count:
+                unverified_semantic_shrink[canon_sf] = (prior_count, fresh_count)
+
     new["nodes"] = [n for n in existing_nodes if not _dropped(n)] + list(new.get("nodes", []))
     new["edges"] = [e for e in existing_edges if not _dropped(e)] + list(new.get("edges", []))
     carried_hyper = [he for he in existing_hyperedges if not _dropped(he)]
     if carried_hyper or new.get("hyperedges"):
         new["hyperedges"] = carried_hyper + list(new.get("hyperedges", []))
+    if unverified_semantic_shrink:
+        new["_unverified_semantic_shrink"] = unverified_semantic_shrink
     return new
 
 
@@ -1664,7 +1747,11 @@ def build_merge(
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
 ) -> nx.Graph:
-    """Load existing graph.json, merge new chunks into it, and save back.
+    """Load existing graph.json and return it merged with ``new_chunks``.
+
+    Does NOT write to disk — the caller persists the result, e.g. via
+    ``export.to_json(G, communities, graph_path, force=True)`` after
+    clustering. ``graph_path`` is read-only here.
 
     Re-extracted files REPLACE their prior contribution per tier (#2333/#2336):
     a source_file present in new_chunks has its existing nodes/edges dropped
@@ -1680,6 +1767,9 @@ def build_merge(
     graph to inherit from. An explicit True/False always overrides the on-disk
     flag.
     """
+    # Iterated more than once below (source sets, the hyperedge carry, the
+    # build itself), so a one-shot iterator must be materialised first.
+    new_chunks = list(new_chunks)
     graph_path = Path(graph_path if graph_path is not None else _default_graph_json())
     _loaded = _load_existing_graph(graph_path)
     if _loaded is not None:
@@ -1742,6 +1832,35 @@ def build_merge(
     # never see the loss it is meant to catch.
     _disk_nodes = existing_nodes
     _disk_n = len(existing_nodes)
+
+    # #3203: Check for unverified semantic shrink on re-extracted sources.
+    # An existing source with prior semantic nodes (> 1) that produces strictly
+    # fewer semantic nodes in this extraction is flagged on G.graph so the CLI
+    # can arm the shrink guard and leave the source unstamped in the manifest.
+    unverified_semantic_shrink: dict[str, tuple[int, int]] = {}
+    if had_graph and new_sem_sources:
+        prior_sem_counts: dict[str, int] = {}
+        for n in _disk_nodes:
+            if isinstance(n, dict) and not _is_ast_tier(n):
+                sf = n.get("source_file")
+                if sf:
+                    canon = _norm_source_file(sf, _replace_root) or sf
+                    prior_sem_counts[canon] = prior_sem_counts.get(canon, 0) + 1
+
+        fresh_sem_counts: dict[str, int] = {}
+        for ch in new_chunks:
+            for n in ch.get("nodes", []):
+                if isinstance(n, dict) and not _is_ast_tier(n):
+                    sf = n.get("source_file")
+                    if sf:
+                        canon = _norm_source_file(sf, _replace_root) or sf
+                        fresh_sem_counts[canon] = fresh_sem_counts.get(canon, 0) + 1
+
+        for canon_sf, fresh_count in fresh_sem_counts.items():
+            prior_count = prior_sem_counts.get(canon_sf, 0)
+            if prior_count > 1 and fresh_count < prior_count:
+                unverified_semantic_shrink[canon_sf] = (prior_count, fresh_count)
+
     if new_sources:
         def _kept(item: dict) -> bool:
             sf = item.get("source_file")
@@ -1756,11 +1875,6 @@ def build_merge(
                 f"source file(s).",
                 file=sys.stderr,
             )
-
-    base = [{"nodes": existing_nodes, "edges": existing_edges}] if had_graph else []
-
-    all_chunks = base + list(new_chunks)
-    G = build(all_chunks, directed=directed, dedup=dedup, dedup_llm_backend=dedup_llm_backend, root=root)
 
     # Prune set for deleted source files — both the raw form (matches nodes that
     # kept absolute source_file) and the normalised relative form (matches nodes
@@ -1828,12 +1942,25 @@ def build_merge(
     # deleted (#1574). build() only sees the new chunks' hyperedges, so without
     # this every --update collapses the graph's hyperedge set down to just the
     # changed files'. Re-extracted files' prior hyperedges are dropped (their new
-    # version is already in G — replace-per-source, like nodes/edges); deleted
-    # files' are dropped via prune_set. id-dedup (attach_hyperedges) so a carried
-    # hyperedge never duplicates one the new chunks re-emitted. Mirrors watch.py,
-    # which already preserves existing hyperedges across a rebuild.
+    # version is already in the new chunks — replace-per-source, like
+    # nodes/edges); deleted files' are dropped via prune_set; id-dedup so a
+    # carried hyperedge never duplicates one the new chunks re-emitted. Mirrors
+    # watch.py, which already preserves existing hyperedges across a rebuild.
+    #
+    # The carried set rides INTO build() on the base chunk rather than being
+    # attached to G afterwards (#3102): entity dedup rewires every edge endpoint
+    # and every hyperedge member it sees onto the survivor (#2805), but a
+    # hyperedge attached after the fact kept naming the merged-away node — a
+    # dangling member with no backing node in the written graph.
+    carried_hyperedges: list[dict] = []
     if existing_hyperedges:
-        carried = []
+        carried = carried_hyperedges
+        _new_hyperedge_ids = {
+            he.get("id")
+            for chunk in new_chunks
+            for he in (chunk.get("hyperedges") or [])
+            if isinstance(he, dict) and he.get("id")
+        }
         for he in existing_hyperedges:
             if not isinstance(he, dict):
                 continue
@@ -1846,10 +1973,17 @@ def build_merge(
                 continue  # semantically re-extracted — replaced by the new chunk's version
             if _prune_match(sf):
                 continue  # deleted — pruned
+            if he.get("id") and he.get("id") in _new_hyperedge_ids:
+                continue  # the new chunks re-emitted it — theirs wins
             carried.append(he)
-        if carried:
-            from graphify.export import attach_hyperedges
-            attach_hyperedges(G, carried)
+
+    base = (
+        [{"nodes": existing_nodes, "edges": existing_edges, "hyperedges": carried_hyperedges}]
+        if had_graph else []
+    )
+
+    all_chunks = base + list(new_chunks)
+    G = build(all_chunks, directed=directed, dedup=dedup, dedup_llm_backend=dedup_llm_backend, root=root)
 
     # Prune nodes and edges from deleted source files
     if prune_sources:
@@ -2007,6 +2141,9 @@ def build_merge(
                 f"{_disk_n} → {G.number_of_nodes()} nodes. "
                 f"Pass prune_sources explicitly if you intend to remove them. (#479)"
             )
+
+    if unverified_semantic_shrink:
+        G.graph["_unverified_semantic_shrink"] = unverified_semantic_shrink
 
     return G
 
