@@ -327,24 +327,26 @@ def test_merge_graphs_prefixes_ids(tmp_path):
     assert merged.number_of_nodes() == 2  # no silent collapse
 
 
-def test_global_add_rewires_edges_to_deduplicated_externals(tmp_path):
-    """Edges incident to an external node that gets deduplicated against an
-    already-present external must be rewired to the existing node, not dropped."""
+def test_global_add_rewires_edges_to_deduplicated_image_join_keys(tmp_path):
+    """Edges incident to a true join-key node (an image, `file_type="image"`)
+    that deduplicates against an already-present image must be rewired to the
+    existing node, not dropped. A sourceless `code` stub must NOT dedup across
+    repos (see test_global_add_does_not_merge_sourceless_code_stubs_cross_repo)."""
     g1 = tmp_path / "graph1.json"
     g2 = tmp_path / "graph2.json"
     GA = _make_graph(
         [
-            {"id": "moda", "label": "ModA", "source_file": "src/a.py"},
-            {"id": "requests", "label": "requests"},
+            {"id": "moda", "label": "ModA", "file_type": "code", "source_file": "src/a.py"},
+            {"id": "image://quay.io/x/y", "label": "quay.io/x/y", "file_type": "image", "source_file": None},
         ],
-        [{"source": "moda", "target": "requests", "relation": "imports"}],
+        [{"source": "moda", "target": "image://quay.io/x/y", "relation": "builds"}],
     )
     GB = _make_graph(
         [
-            {"id": "modb", "label": "ModB", "source_file": "src/b.py"},
-            {"id": "requests", "label": "requests"},
+            {"id": "modb", "label": "ModB", "file_type": "code", "source_file": "src/b.py"},
+            {"id": "image://quay.io/x/y", "label": "quay.io/x/y", "file_type": "image", "source_file": None},
         ],
-        [{"source": "modb", "target": "requests", "relation": "imports"}],
+        [{"source": "modb", "target": "image://quay.io/x/y", "relation": "runs"}],
     )
     _graph_to_json(GA, g1)
     _graph_to_json(GB, g2)
@@ -358,14 +360,94 @@ def test_global_add_rewires_edges_to_deduplicated_externals(tmp_path):
         global_add(g2, "repoB")
         G = _load_global_graph()
 
-    # repoB's external "requests" was deduplicated against repoA's
-    assert "repoA::requests" in G.nodes
-    assert "repoB::requests" not in G.nodes
+    # repoB's image join key was deduplicated against repoA's.
+    assert "repoA::image://quay.io/x/y" in G.nodes
+    assert "repoB::image://quay.io/x/y" not in G.nodes
     # repoA's edge is untouched
-    assert G.has_edge("repoA::moda", "repoA::requests")
-    # repoB's edge must be rewired to the existing external node, not dropped
-    assert G.has_edge("repoB::modb", "repoA::requests")
-    assert G.edges["repoB::modb", "repoA::requests"]["relation"] == "imports"
+    assert G.has_edge("repoA::moda", "repoA::image://quay.io/x/y")
+    # repoB's edge must be rewired to the existing image node, not dropped
+    assert G.has_edge("repoB::modb", "repoA::image://quay.io/x/y")
+    assert G.edges["repoB::modb", "repoA::image://quay.io/x/y"]["relation"] == "runs"
+
+
+def test_global_add_does_not_merge_sourceless_code_stubs_cross_repo(tmp_path):
+    """A sourceless ``code`` node is an external-library/builtin symbol stub
+    minted per-repo (``Client``, ``str``, ``Exception``, ...). Same label does
+    NOT mean same entity, so global_add must keep each repo's stub distinct
+    rather than collapse them by label. Only true join-key nodes (images) dedup.
+    """
+    g1 = tmp_path / "graph1.json"
+    g2 = tmp_path / "graph2.json"
+    GA = _make_graph(
+        [
+            {"id": "moda", "label": "ModA", "file_type": "code", "source_file": "src/a.py"},
+            {"id": "client", "label": "Client", "file_type": "code", "source_file": None},
+        ],
+        [{"source": "moda", "target": "client", "relation": "references"}],
+    )
+    GB = _make_graph(
+        [
+            {"id": "modb", "label": "ModB", "file_type": "code", "source_file": "src/b.py"},
+            {"id": "client", "label": "Client", "file_type": "code", "source_file": None},
+        ],
+        [{"source": "modb", "target": "client", "relation": "references"}],
+    )
+    _graph_to_json(GA, g1)
+    _graph_to_json(GB, g2)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "repoA")
+        global_add(g2, "repoB")
+        G = _load_global_graph()
+
+    # Both repos keep their OWN sourceless code stub — no cross-repo collapse.
+    assert "repoA::client" in G.nodes
+    assert "repoB::client" in G.nodes
+    # Each repo's edge stays pointed at its own stub, never rewired cross-repo.
+    assert G.has_edge("repoA::moda", "repoA::client")
+    assert G.has_edge("repoB::modb", "repoB::client")
+    assert not G.has_edge("repoA::moda", "repoB::client")
+    assert not G.has_edge("repoB::modb", "repoA::client")
+
+
+def test_global_add_still_dedups_image_join_key_cross_repo(tmp_path):
+    """The join-key contract (image nodes with source_file=None) still collapses
+    across repos by label — that is the cross-repo image join, and must survive
+    the narrowing of the sourceless-stub merge."""
+    g1 = tmp_path / "graph1.json"
+    g2 = tmp_path / "graph2.json"
+    GA = _make_graph(
+        [
+            {"id": "k8s://_cluster/Deployment/web", "label": "Deployment/web", "file_type": "k8s", "source_file": "a/deploy.yaml"},
+            {"id": "image://ghcr.io/org/app", "label": "ghcr.io/org/app", "file_type": "image", "source_file": None},
+        ],
+        [{"source": "k8s://_cluster/Deployment/web", "target": "image://ghcr.io/org/app", "relation": "runs"}],
+    )
+    GB = _make_graph(
+        [
+            {"id": "ci:///app/workflows/build", "label": "build", "file_type": "ci", "source_file": "b/wf.yaml"},
+            {"id": "image://ghcr.io/org/app", "label": "ghcr.io/org/app", "file_type": "image", "source_file": None},
+        ],
+        [{"source": "ci:///app/workflows/build", "target": "image://ghcr.io/org/app", "relation": "publishes"}],
+    )
+    _graph_to_json(GA, g1)
+    _graph_to_json(GB, g2)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(g1, "repoA")
+        global_add(g2, "repoB")
+        G = _load_global_graph()
+
+    image_nodes = [n for n, d in G.nodes(data=True) if d.get("file_type") == "image"]
+    assert len(image_nodes) == 1, f"image join key must still dedup, got {image_nodes}"
 
 
 def test_global_add_rejects_oversized_source_graph(monkeypatch, tmp_path):

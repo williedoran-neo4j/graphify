@@ -204,24 +204,10 @@ def test_cache_dedup_across_repos_shared_external_library_node(
 
         result1 = global_reembed()
         assert result1["written"] is True
-        assert result1["nodes"] == 3  # acceptance + requests + api
-        # Cold run over the 3 post-add nodes, ONE seam call per space: the text
-        # call carries the two documents' constructed texts; the code call
-        # carries ONLY the shared external text — under the canonical
-        # ``repoA::requests`` id (repoB's bare ``http`` was deduped out by
-        # ``global_add``, so it contributes no row). The two calls are
-        # SET-compared: the space iteration order is an implementation detail.
-        assert len(recorded) == 2, recorded
-        assert {k["model"] for _, k in recorded} == {
-            "nomic-embed-text",
-            "nomic-embed-code",
-        }
-        by_model = {k["model"]: k["inputs"] for _, k in recorded}
-        assert set(by_model["nomic-embed-text"]) == {
-            "Acceptance flow\ndocs/acceptance.md\n\n",
-            "API flow\ndocs/api.md\n\n",
-        }
-        assert by_model["nomic-embed-code"] == ["HTTP requests\n\n\n"]
+        # A sourceless `code` node is a per-repo stub, not a shared external:
+        # global_add no longer collapses same-label code stubs across repos, so
+        # repoA's `requests` and repoB's `http` remain distinct nodes.
+        assert result1["nodes"] == 4  # acceptance + requests + api + http
 
         # The repo-agnostic cache key: the shared code text's entry exists at
         # the sha256(constructed text) path under the CODE namespace (the
@@ -234,21 +220,22 @@ def test_cache_dedup_across_repos_shared_external_library_node(
         )
         assert cache_entry.is_file()
 
-        # WARM re-run over the unchanged post-add global graph: repoB's
-        # external node was dedup-canonicalized to repoA::requests (its text
-        # is the SAME string), so the vector is served from the shared cache
-        # entry — ZERO additional seam calls. This is the dedup observation.
+        # WARM re-run over the unchanged post-add global graph: both code stubs
+        # (repoA::requests, repoB::http) construct the IDENTICAL text
+        # ("HTTP requests\\n\\n\\n"), so even though the nodes stay distinct, the
+        # two vectors are both served from the single text-keyed cache entry —
+        # ZERO additional seam calls. The cache key is text, not node id.
         recorded.clear()
         result2 = global_reembed()
         assert result2["written"] is True
-        assert result2["nodes"] == 3
+        assert result2["nodes"] == 4
         assert len(recorded) == 0, recorded
 
     sidecar = global_dir / "embeddings-global.npz"
     assert sidecar.is_file()
     with np.load(sidecar) as data:
         assert list(data["text_ids"]) == ["repoA::acceptance", "repoB::api"]
-        assert list(data["code_ids"]) == ["repoA::requests"]
+        assert list(data["code_ids"]) == ["repoA::requests", "repoB::http"]
 
 
 def test_global_sidecar_no_bare_local_ids(tmp_path, monkeypatch):

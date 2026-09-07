@@ -122,17 +122,22 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
     G = _load_global_graph()
     removed = prune_repo_from_graph(G, repo_tag)
 
-    # Merge external-library nodes (no source_file) by label to avoid duplication
+    # Merge external-image nodes by label to avoid duplication. Only true join-key
+    # nodes (images — contract C5: a tag-less registry path ids an image uniquely
+    # across repos) may collapse by label. A sourceless `code`/other node is a
+    # per-repo external-library/builtin symbol stub (`Client`, `str`, `Exception`,
+    # ...) where same-label does NOT mean same entity; collapsing those silently
+    # rewires a repo's `references`/`imports` edges onto an unrelated repo's stub.
     external_labels = {
         d.get("label", ""): n
         for n, d in G.nodes(data=True)
-        if not d.get("source_file") and d.get("label")
+        if d.get("file_type") == "image" and not d.get("source_file") and d.get("label")
     }
     # Map each deduplicated external onto the existing global node so that
     # edges incident to it can be rewired instead of dropped.
     remap = {}
     for node, data in prefixed.nodes(data=True):
-        if not data.get("source_file") and data.get("label") in external_labels:
+        if data.get("file_type") == "image" and not data.get("source_file") and data.get("label") in external_labels:
             remap[node] = external_labels[data["label"]]
 
     # Compose: add prefixed nodes (except deduplicated externals) into global graph
