@@ -464,10 +464,11 @@ def test_vector_index_emitted_once_per_space_failure_non_fatal(
     assert "no_vec" in node_queries
     assert "SET n:Embedded" not in node_queries["no_vec"]
 
-    # Exactly two index statements, one per space, each once, idempotent and
-    # dimensioned from the sidecar meta.
+    # Exactly two vector-index statements, one per space, each once, idempotent
+    # and dimensioned from the sidecar meta. (The push also emits a separate
+    # :GraphifyNode range index; keep this assertion scoped to vector indexes.)
     ddl = [q for q, _ in push_log if "CREATE VECTOR INDEX" in q]
-    assert ddl == [q for q, _ in push_log if "IF NOT EXISTS" in q]
+    assert ddl and all("IF NOT EXISTS" in q for q in ddl)
     assert len([q for q in ddl if "embedding_text" in q]) == 1
     assert len([q for q in ddl if "embedding_code" in q]) == 1
     text_ddl = next(q for q in ddl if "embedding_text" in q)
@@ -831,3 +832,44 @@ def test_hostile_punctuation_parameterized_not_interpolated(monkeypatch):
     # The parameterized placeholders must still be present in the query text.
     assert "{id: $id}" in query
     assert "SET n += $props" in query
+
+
+def test_push_to_neo4j_creates_id_range_index_before_edges(monkeypatch):
+    """The edge loop MATCHes ``(a {id: $src})`` with no bounded label, which is a
+    full node scan per edge — quadratic on a large graph. A push must instead:
+    (a) tag every node MERGE with the stable :GraphifyNode label, and
+    (b) emit a CREATE INDEX ... FOR (n:GraphifyNode) ON (n.id) DDL that runs
+    BEFORE the first edge MERGE statement, so the edge MATCH is an O(1) index
+    lookup rather than a scan.
+    """
+    G = nx.Graph()
+    G.add_node("n1", label="a", file_type="code")
+    G.add_node("n2", label="b", file_type="document")
+    G.add_edge("n1", "n2", relation="references")
+
+    log = []
+    _install_fake_neo4j(monkeypatch, log)
+    push_to_neo4j(G, uri="bolt://localhost:7687", user="neo4j", password="pw")
+    push_log = [(q, p) for kind, q, p in log if kind == "neo4j"]
+
+    node_merges = [(q, p) for q, p in push_log if "SET n +=" in q]
+    edge_merges = [(q, p) for q, p in push_log if "MERGE (a)" in q]
+
+    # (a) every node MERGE carries the :GraphifyNode stable label.
+    for query, _ in node_merges:
+        assert "n:GraphifyNode" in query
+
+    # (b) exactly one id range index on GraphifyNode, idempotent.
+    id_ddl = [q for q, _ in push_log if "CREATE INDEX" in q and "GraphifyNode" in q and "n.id" in q]
+    assert len(id_ddl) == 1
+    assert "IF NOT EXISTS" in id_ddl[0]
+
+    # The index DDL runs before the first edge MERGE statement.
+    first_edge_idx = min(
+        i for i, (q, _) in enumerate(push_log) if "MERGE (a)" in q
+    )
+    ddl_idx = min(i for i, (q, _) in enumerate(push_log) if q in id_ddl)
+    assert ddl_idx < first_edge_idx
+
+    # Edges still MERGE by id as before, but now the lookup is indexed.
+    assert len(edge_merges) == 1

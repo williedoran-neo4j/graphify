@@ -186,6 +186,7 @@ def push_to_neo4j(
             ftype = _safe_label(data.get("file_type", "Entity").capitalize())
             session.run(
                 f"MERGE (n:{ftype} {{id: $id}})"
+                f" SET n:GraphifyNode"
                 f"{' SET n:Embedded' if embedded else ''} SET n += $props",
                 id=node_id,
                 props=props,
@@ -195,11 +196,26 @@ def push_to_neo4j(
         if dims is not None:
             _emit_vector_indexes(session.run, dims)
 
+        # An unindexed ``{id: ...}`` MATCH is a full node scan per edge, which is
+        # quadratic on a large graph (a 100k-node / 265k-edge push ran for hours).
+        # Every node MERGE above tags the stable :GraphifyNode label; index its
+        # ``id`` once so the edge MATCH below is an O(1) range lookup. Guarded so
+        # a driver that cannot build a range index (older server) still pushes.
+        try:
+            result = session.run(
+                "CREATE INDEX graphify_id IF NOT EXISTS "
+                "FOR (n:GraphifyNode) ON (n.id)"
+            )
+            if result is not None and hasattr(result, "consume"):
+                result.consume()
+        except Exception:
+            pass
+
         for u, v, data in G.edges(data=True):
             rel = _safe_rel(data.get("relation", "RELATED_TO"))
             props = _pushable_props(data)
             session.run(
-                f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
+                f"MATCH (a:GraphifyNode {{id: $src}}), (b:GraphifyNode {{id: $tgt}}) "
                 f"MERGE (a)-[r:{rel}]->(b) SET r += $props",
                 src=u,
                 tgt=v,
