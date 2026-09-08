@@ -1446,6 +1446,54 @@ def test_resolve_k8s_references_emits_issues_edge_from_issuer_to_certificate():
     assert edge["confidence"] == "EXTRACTED"
 
 
+def test_resolve_k8s_references_skips_kustomize_slug_issuer_and_still_emits_issues():
+    """A kustomize-emitted ClusterIssuer carries a file-slug id with no `k8s://`
+    (e.g. `components_cert_manager_...`). The TLS pass must SKIP it (it cannot be
+    a (kind, name) target) rather than crash the whole issues/serves pass — the
+    resolver registry swallows the exception, which would silently drop every
+    issues edge for the real issuers."""
+    all_nodes = [
+        # kustomize-emitted issuer — NO k8s:// in id, would previously IndexError.
+        {
+            "id": "components_cert_manager_k8s_overlays_letsencrypt_cluster_issuer_yaml",
+            "label": "ClusterIssuer/letsencrypt-orchestra-issuer",
+            "file_type": "k8s",
+            "source_file": "letme.yaml",
+            "attributes": {"kind": "ClusterIssuer", "namespace": "_cluster"},
+        },
+        # real issuer
+        {
+            "id": "k8s://_cluster/ClusterIssuer/aura-cluster-issuer",
+            "label": "ClusterIssuer/aura-cluster-issuer",
+            "file_type": "k8s",
+            "source_file": "issuer.yaml",
+            "attributes": {"kind": "ClusterIssuer", "namespace": "_cluster"},
+        },
+        # real cert
+        {
+            "id": "k8s://default/Certificate/db-cert",
+            "label": "Certificate/db-cert",
+            "file_type": "k8s",
+            "source_file": "cert.yaml",
+            "attributes": {
+                "kind": "Certificate",
+                "namespace": "default",
+                "issuer_kind": "ClusterIssuer",
+                "issuer_name": "aura-cluster-issuer",
+                "cert_dns_names": ["db.default.svc.cluster.local"],
+            },
+        },
+    ]
+
+    all_edges: list[dict] = []
+    _resolve_k8s_references([], all_nodes, all_edges)
+
+    issues = [e for e in all_edges if e.get("relation") == "issues"]
+    assert len(issues) == 1, f"Expected 1 issues edge despite the slug issuer, got {issues}"
+    assert issues[0]["source"] == "k8s://_cluster/ClusterIssuer/aura-cluster-issuer"
+    assert issues[0]["target"] == "k8s://default/Certificate/db-cert"
+
+
 def test_resolve_k8s_references_emits_serves_edge_from_certificate_to_service():
     """R7-S4 — a Certificate's spec.dnsNames (`<svc>.<ns>.svc[.cluster.local]`)
     links the Certificate to the Service by (namespace, name) via a `serves` edge

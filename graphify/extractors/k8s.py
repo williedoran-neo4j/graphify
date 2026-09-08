@@ -799,20 +799,28 @@ def _resolve_k8s_references(
     # serves. Exact matches, EXTRACTED; an absent issuer/service is left unlinked.
     certs = [n for n in all_nodes if (n.get("attributes") or {}).get("kind") == "Certificate"]
     if certs:
-        # Issuer/ClusterIssuer index: id `k8s://<ns>/<Kind>/<name>`.
+        # Issuer/ClusterIssuer index: id `k8s://<ns>/<Kind>/<name>` (possibly
+        # behind a `repo::` merge prefix — split on the LAST `k8s://`). A
+        # kustomize-emitted issuer carries a file-slug id with NO `k8s://`; skip
+        # it rather than crash the whole pass (the resolver swallows the raise,
+        # which would silently drop every issues/serves edge).
         issuer_index: dict[tuple[str, str], dict] = {}
         for node in all_nodes:
             attrs = node.get("attributes") or {}
             if attrs.get("kind") in ("Issuer", "ClusterIssuer"):
                 node_id = node.get("id", "")
-                _, kind, name = node_id[len("k8s://"):].split("/", 2)
+                if "k8s://" not in node_id:
+                    continue
+                _, kind, name = node_id.rsplit("k8s://", 1)[1].split("/", 2)
                 issuer_index[(kind, name)] = node
         service_index: dict[tuple[str, str], dict] = {}
         for node in all_nodes:
             attrs = node.get("attributes") or {}
             if attrs.get("kind") == "Service":
                 node_id = node.get("id", "")
-                namespace, _, name = node_id[len("k8s://"):].split("/", 2)
+                if "k8s://" not in node_id:
+                    continue
+                namespace, _, name = node_id.rsplit("k8s://", 1)[1].split("/", 2)
                 service_index[(namespace, name)] = node
         seen_issues: set[tuple[str, str]] = set()
         seen_serves: set[tuple[str, str]] = set()
