@@ -26,39 +26,52 @@ same-named* node in another repo.
   `REFERENCES` resolution, and drop `REFERENCES` whose target is a `.`-method or a
   builtin that merely shares a name across repos.
 
-### 2. `ISSUES` / `SERVES` / `POINTS_TO` = 0 in the pushed graph — stale extract, not missing code (MEDIUM — operational)
+### 2. `ISSUES` / `SERVES` = 0 — FIXED (kustomize-slug issuer crashed the TLS pass)
 
-**Corrected diagnosis (2026-09-07).** `issues` (80) and `serves` (22) ARE emitted
-by the current code when `extract_k8s` + `_resolve_k8s_references` run on
-`neo4j-cloud` (89 cert-manager `Certificate` resources). `points_to` is emitted by
-`env_endpoints` on `.env*` files. The zero counts in Neo4j were because the pushed
-`global-graph.json` was built from **stale/partial repo extractions** (pre-merge,
-and `.env` was then unclassified), not because the extractors are broken.
+**Final diagnosis + fix (commit `a13aea2`).** A kustomize-emitted `ClusterIssuer`
+carries a file-slug id with no `k8s://` (e.g.
+`components_cert_manager_k8s_overlays_...`). The TLS pass's
+`node_id[len("k8s://"):].split("/", 2)` unpacked one element into three and
+raised; `run_language_resolvers` swallows resolver exceptions (resolver_registry.py
+`except Exception: _LOG.warning`), so the whole `issues`/`serves` block died
+silently while `defines`/`selects`/`references` (earlier in the same pass) landed.
+Fix: skip Issuer/ClusterIssuer/Service nodes whose id has no `k8s://`.
 
-Sub-parts:
-- `issues` / `serves` — present in code, present in a fresh extract; missing only
-  in the stale push.
-- `points_to` — present in code; `.env` now routes correctly (post-merge
-  `extract_env_endpoints`). Re-extract + re-join + re-push to recover.
-- `publishes` — **correctly absent**. Of 23 CI workflows across the 6 repos, 20
-  publish via a shell var (`docker push "$AURA_LATEST_IMAGE"`), and the 3 with a
-  concrete `-t` use non-registry / var-suffixed names. I5 says vars never become
-  image nodes, so no `publishes` edge is the *right* answer — there is no
-  concrete, cross-repo-shareable image path to join on in this corpus.
+Result: `neo4j-cloud` `graph.json` now carries `issues=80, serves=8` (was None).
+`serves` is lower than the theoretical 22 because many `spec.dnsNames` targets are
+under `.graphifyignore`-d components (see #2b), but the mechanism is proven and
+teeth-tested.
 
-- **Fix:** re-run a fresh `extract` (full, not `--code-only`) on `upx` and
-  `neo4j-cloud`, `global add` each, `global re-embed`, re-push. No source change.
+`publishes` — **correctly absent**. Of 23 CI workflows across the 6 repos, 20
+publish via a shell var (`docker push "$AURA_LATEST_IMAGE"`); the 3 with a
+concrete `-t` use non-registry / var-suffixed names. I5 says vars never become
+image nodes, so no `publishes` edge is the right answer for this corpus.
 
-### 3. `endpoint://` nodes / `points_to` bridge — present in code, recoverable by re-extract (part of #2)
+### 2b. neo4j-cloud `.graphifyignore` scoped out most components (RESOLVED by config edit)
 
-The upx UI calls its backend via runtime `VITE_*` endpoints (e.g.
-`VITE_AURA_GENAI_API_BASE_URL`, the kg-builder agent API). That is exactly the
-`endpoint://<host>` + `points_to` layer, and it is the only legitimate hop from
-`upx UI → kg-builder` for the **extraction-from-a-data-source** path (the local-file
-path correctly stays intra-upx). `.env` now routes correctly (post-merge), so a
-fresh extract of `upx` recovers it: there is no upx→kg-builder path in the *pushed*
-graph, but the extractor emits it.
-correctly-absent local-file one (fine) nor the should-exist data-source one (bug).
+neo4j-cloud's `.graphifyignore` was a 231-entry deny-list of `components/*/` and
+`libs/*/` (generated, "only kg-builder components indexed"). That hid ~84 of 93
+cert-manager `Certificate` resources, all their issuers/services, and the bulk of
+the Go services. Un-ignoring `components/`+`libs/` (commenting those entries,
+`.graphifyignore.bak` kept) grew neo4j-cloud from 18.9k → 131k nodes and put the
+full TLS/CRD/k8s subgraph in scope. The edit is uncommitted in the neo4j-cloud repo
+(repo policy call: commit it or restore the `.bak`).
+
+### 3. `endpoint://` nodes / `points_to` bridge — FIXED (git-tracked `.env.*` now graphable)
+
+The upx UI calls its backend via runtime `VITE_*` endpoints
+(`VITE_AURA_GENAI_API_BASE_URL`, the kg-builder agent API). That is the
+`endpoint://<host>` + `points_to` layer — the only legitimate hop from
+`upx UI → kg-builder` for the **extraction-from-a-data-source** path (the
+local-file path correctly stays intra-upx). Two routing gaps were fixed:
+
+- `.env*` files were skipped as "potentially sensitive" (and unclassified). Now a
+  **git-tracked** `.env.<env>` is a committed placeholder and is graphable (commit
+  `6f75281`), while bare `.env`/`.env.local`/`.env.*.local`/`.env.*.bak` stay
+  excluded. Result: `POINTS_TO=34`, `endpoint://` nodes present.
+- Remaining gap: the **host→ingress** join (`endpoint://host` → a foreign-repo
+  `Ingress.spec.rules[].host`) is not implemented, and most SaaS hosts
+  (`console.neo4j.io` etc.) have no in-corpus Ingress to match anyway.
 
 ## Gaps (absent-but-expected, not corrupting)
 
